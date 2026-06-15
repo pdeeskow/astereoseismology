@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtuelle Umgebung
+.venv/
+venv/
+env/
+
+# uv
+uv.lock
+
+# TESS-Daten-Cache — wird automatisch befüllt, nicht einchecken
+data/cache/*
+!data/cache/.gitkeep
+
+# Erzeugte Ergebnisse — lokal reproduzierbar, nicht einchecken
+results/figures/*
+results/tables/*
+!results/figures/.gitkeep
+!results/tables/.gitkeep
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+
+# Distribution
+dist/
+build/
+*.egg-info/
