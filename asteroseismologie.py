@@ -1,28 +1,38 @@
 #!/usr/bin/env python3
 """
-Asteroseismologie-Workflow: Solar-like Oscillators mit TESS
-===========================================================
-Vollständiger Pipeline von der TESS-Lichtkurve bis zu abgeleiteten
+Asteroseismologie-Workflow: Solar-like Oscillators mit TESS und Kepler
+=======================================================================
+Vollständiger Pipeline von der Lichtkurve bis zu abgeleiteten
 Stellar-Parametern (M, R, log g, L) via Skalenrelationen.
+
+Unterstützte Archive (auto-detektiert aus dem Ziel-Präfix):
+  TIC …  → TESS SPOC  (2 min, Nyquist ≈ 4167 μHz)
+  KIC …  → Kepler LC  (30 min, Nyquist ≈  278 μHz)
+  EPIC … → K2 LC      (30 min, Nyquist ≈  278 μHz)
 
 νmax wird vollautomatisch bestimmt — kein Schätzwert erforderlich:
   [1] Harvey-Hintergrundfit im Log-Raum
   [2] SNR-Spektrum (PSD / Hintergrund)
-  [3] Erster νmax-Kandidat aus geglättetem SNR
+  [3] Erster νmax-Kandidat aus geglättetem SNR (oberhalb Harvey-Knie)
   [4] Gauß-Fit zur finalen νmax-Bestimmung
 
 Verwendung
 ----------
-    uv run asteroseismologie.py                             # η Serpentis (Default)
-    uv run asteroseismologie.py --tic "TIC 272821450"       # ε Ophiuchi
-    uv run asteroseismologie.py --name "η Ser" --teff 4970  # explizite Teff
-    uv run asteroseismologie.py --fmax 500 --oversample 2   # schneller Test
+    uv run asteroseismologie.py                                   # η Serpentis (Default)
+    uv run asteroseismologie.py --tic "KIC 4351319" --teff 4800   # Kepler-Roter-Riese
+    uv run asteroseismologie.py --tic "TIC 272821450" --teff 4900  # ε Ophiuchi
+    uv run asteroseismologie.py --oversample 2                     # schneller Test
 """
 from __future__ import annotations
 
 import argparse
+import sys
 import warnings
 from pathlib import Path
+
+# UTF-8-Ausgabe erzwingen — verhindert UnicodeEncodeError auf Windows (cp1252)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import lightkurve as lk
 import matplotlib.pyplot as plt
@@ -54,32 +64,78 @@ OVERSAMPLE = 5
 # Schritt 1 — Lichtkurve laden und bereinigen
 # ===========================================================================
 
-def load_lightcurve(tic_id: str, max_sectors: int = 4) -> lk.LightCurve:
+def _mission_defaults(target_id: str) -> tuple[str, int, float]:
     """
-    Lädt TESS-2-Minuten-Lichtkurven (SPOC) vom MAST-Archiv.
+    Liefert (author, exptime_s, min_span_days) passend zum Zielidentifikator.
 
+    KIC  → Kepler Long Cadence (1800 s); Q0 (~9d) und Q1 (~33d) werden mit
+           min_span=60d automatisch übersprungen, Q2+ (~90d) werden genutzt.
+    EPIC → K2 Long Cadence    (1800 s); Kampagnen sind ~80 d, min_span=60d.
+    sonst → TESS SPOC 2-min   (120 s);  Sektoren sind ~27 d, min_span=20d.
+    """
+    tid = target_id.strip().upper()
+    if tid.startswith("KIC"):
+        return "Kepler", 1800, 60.0
+    if tid.startswith("EPIC"):
+        return "K2", 1800, 60.0
+    return "SPOC", 120, 20.0
+
+
+def load_lightcurve(
+    target_id: str,
+    max_sectors: int = 1,
+    author: str | None = None,
+    exptime: int | None = None,
+) -> lk.LightCurve:
+    """
+    Lädt Lichtkurven vom MAST-Archiv (TESS, Kepler oder K2).
+
+    Mission wird automatisch aus dem Ziel-Präfix (TIC/KIC/EPIC) ermittelt;
+    --author und --exptime überschreiben die Auto-Erkennung.
     Gibt eine in ppm normierte, zusammengeführte Lichtkurve zurück.
     """
-    search = lk.search_lightcurve(tic_id, author="SPOC", exptime=120)
-    if len(search) == 0:
-        raise ValueError(f"Keine SPOC-Daten für {tic_id} gefunden.")
+    _author, _exptime, min_span = _mission_defaults(target_id)
+    author  = author  or _author
+    exptime = exptime or _exptime
 
-    n = min(len(search), max_sectors)
-    print(f"  Gefunden: {len(search)} Sektor(en), lade {n}")
-    lc_coll = search[:n].download_all(quality_bitmask="hardest")
+    search = lk.search_lightcurve(target_id, author=author, exptime=exptime)
+    if len(search) == 0:
+        raise ValueError(
+            f"Keine Daten für '{target_id}' gefunden "
+            f"(author='{author}', exptime={exptime} s).\n"
+            f"  Tipp: --author Kepler --exptime 1800  für Kepler-Sterne\n"
+            f"        --author SPOC   --exptime 120    für TESS-Sterne"
+        )
+
+    # Lade etwas mehr als max_sectors, um sehr kurze Quartale (z. B. Kepler Q0
+    # mit nur ~9 d) herausfiltern zu können, ohne zu wenig Daten zu erhalten.
+    n_try = min(len(search), max_sectors + 3)
+    print(f"  Gefunden: {len(search)} Sektor(en)/Quartale, lade Kandidaten ...")
+    lc_coll = search[:n_try].download_all(quality_bitmask="hardest")
 
     lcs = []
+    skipped = 0
     for lc in lc_coll:
         lc_clean = lc.remove_nans().remove_outliers(sigma=4.0)
         if len(lc_clean) == 0:
+            skipped += 1
+            continue
+        span = float(lc_clean.time.value[-1] - lc_clean.time.value[0])
+        if span < min_span and len(lcs) == 0 and (n_try - skipped) > max_sectors:
+            # Zu kurz und wir haben noch Reservekandidaten — überspringen
+            skipped += 1
+            print(f"  Überspringe kurzes Segment ({span:.1f} d < {min_span:.0f} d)")
             continue
         median   = float(lc_clean.flux.value.mean())
         flux_ppm = (lc_clean.flux.value / median - 1.0) * 1e6
         lcs.append(lk.LightCurve(time=lc_clean.time, flux=flux_ppm))
+        if len(lcs) >= max_sectors:
+            break
 
     if not lcs:
-        raise RuntimeError("Alle heruntergeladenen Sektoren sind leer nach Bereinigung.")
+        raise RuntimeError("Alle heruntergeladenen Sektoren sind leer oder zu kurz.")
 
+    print(f"  Verwende {len(lcs)} Segment(e)")
     if len(lcs) > 1:
         return lk.LightCurveCollection(lcs).stitch()
     return lcs[0]
@@ -99,9 +155,15 @@ def compute_power_spectrum(
     Berechnet die einseitige PSD in ppm²/μHz mittels Lomb-Scargle.
 
     Frequenzauflösung: δf = 1 / (oversample · T_gesamt)
+    fmax wird automatisch auf 90 % der Nyquist-Frequenz des Datensatzes
+    gecappt — verhindert Aliasing bei Kepler Long Cadence (Nyquist ≈ 278 μHz).
     """
     time_s   = lc.time.value * 86400.0
     flux_ppm = lc.flux.value
+
+    dt_s         = float(np.median(np.diff(time_s)))
+    nyquist_uHz  = 1e6 / (2.0 * dt_s)
+    fmax_uHz     = min(fmax_uHz, 0.9 * nyquist_uHz)
 
     T_s      = time_s[-1] - time_s[0]
     df_uHz   = 1e6 / (oversample * T_s)
@@ -128,29 +190,58 @@ def fit_harvey_background(
     freq: np.ndarray, power: np.ndarray
 ) -> tuple[np.ndarray, tuple[float, float, float, float] | None]:
     """
-    Passt das Harvey-Modell im Log-Raum an das gesamte Powerspektrum.
+    Passt das Harvey-Modell im Log-Raum an das Powerspektrum.
 
-    Fit im Log-Raum gewichtet alle Frequenzdekaden gleichmäßig und ist
-    robuster gegen den großen Dynamikbereich der PSD.
+    Fit erfolgt nur auf dem unteren 10 % des Frequenzbereichs (mindestens
+    50 Bins), wo die Granulation dominiert und der Oszillations-Buckel
+    noch nicht stört. Das gefittete Modell wird auf den vollen Bereich
+    extrapoliert. Damit wird b nicht durch den Oszillationsexzess verzerrt.
     """
     log_power = np.log10(np.clip(power, 1e-10, None))
 
     def log_harvey(f, log_a, log_b, c, log_w):
         return np.log10(_harvey_model(f, 10**log_a, 10**log_b, c, 10**log_w))
 
-    p0 = [
-        np.log10(power[0]),
-        np.log10(freq[len(freq) // 10]),
-        2.5,
-        np.log10(np.percentile(power, 5)),
+    # Fit-Bereich: 2 %–15 % von fmax.
+    # Untergrenze (2 %) überspringt DC-Spike und sehr niederfrequentes Rot-Rauschen.
+    # Obergrenze (15 %) liegt für typische Rote Riesen noch unterhalb des
+    # Oszillations-Buckels (νmax > 15 % × fmax bei fmax = 300 μHz → νmax > 45 μHz).
+    i_lo = max(0, np.searchsorted(freq, freq[-1] * 0.02))
+    i_hi = np.searchsorted(freq, freq[-1] * 0.15)
+    if i_hi - i_lo < 30:           # Fallback wenn Bereich zu schmal
+        i_lo = 0
+        i_hi = max(50, int(len(freq) * 0.10))
+    f_bg   = freq[i_lo:i_hi]
+    lp_bg  = log_power[i_lo:i_hi]
+
+    # Datengetriebene Bounds (über gesamtes Spektrum für Extrapolations-Stabilität)
+    lp_lo = log_power.min() - 1.0
+    lp_hi = log_power.max() + 1.0
+    lf_lo = np.log10(freq[0])
+    lf_hi = np.log10(freq[-1])
+    bounds_lo = [lp_lo, lf_lo, 0.5, lp_lo]
+    bounds_hi = [lp_hi, lf_hi, 6.0, lp_hi]
+
+    # Weißrauschen aus dem hohen Frequenzende schätzen
+    w_guess = float(np.median(power[int(len(power) * 0.8):]))
+
+    p0_raw = [
+        np.log10(max(power[0], 1e-10)),          # log_a: Granulationsamplitude
+        np.log10(freq[len(freq) // 10]),          # log_b: Knie bei ~10 % von fmax
+        2.5,                                       # c: Exponent
+        np.log10(max(w_guess, 1e-10)),            # log_w: Weißrauschen
     ]
-    bounds = ([-2, -1, 0.5, -5], [8, 4, 6.0, 5])
+    eps = 1e-6
+    p0 = [float(np.clip(v, bounds_lo[i] + eps, bounds_hi[i] - eps))
+          for i, v in enumerate(p0_raw)]
 
     try:
         popt, _ = curve_fit(
-            log_harvey, freq, log_power, p0=p0, bounds=bounds, maxfev=10_000
+            log_harvey, f_bg, lp_bg,
+            p0=p0, bounds=(bounds_lo, bounds_hi), maxfev=10_000
         )
         a, b, c, w = 10**popt[0], 10**popt[1], popt[2], 10**popt[3]
+        # Extrapolation auf den vollen Frequenzbereich
         return _harvey_model(freq, a, b, c, w), (a, b, c, w)
     except RuntimeError:
         sigma    = max(1, len(freq) // 10)
@@ -211,7 +302,13 @@ def _refine_numax(
 
     try:
         popt, _ = curve_fit(gauss_plus_bg, f_fit, s_fit, p0=p0, bounds=bounds, maxfev=5_000)
-        return float(popt[1]), float(abs(popt[2]))
+        numax_fit = float(popt[1])
+        sigma_fit = float(abs(popt[2]))
+        # Fit am Bandpassrand → kein echtes Maximum gefunden → Kandidat beibehalten
+        margin = 0.05 * (band_hi - band_lo)
+        if numax_fit < band_lo + margin or numax_fit > band_hi - margin:
+            return numax_cand, numax_cand * 0.25
+        return numax_fit, sigma_fit
     except RuntimeError:
         return numax_cand, numax_cand * 0.25
 
@@ -235,10 +332,17 @@ def estimate_numax_auto(
     # 3b: SNR-Spektrum
     snr = _compute_snr_spectrum(power, bg_model)
 
-    # 3c: Erster Kandidat
-    numax_cand, snr_smooth = _find_numax_candidate(freq, snr)
+    # 3c: Erster Kandidat — Suche startet oberhalb des Harvey-Knies,
+    # damit die Granulations-dominierte Region nicht als Kandidat landet.
+    if harvey_params is not None:
+        b_harvey = harvey_params[1]
+        fmin_candidate = float(np.clip(3.0 * b_harvey, 5.0, freq[-1] * 0.5))
+    else:
+        fmin_candidate = 5.0
+    numax_cand, snr_smooth = _find_numax_candidate(freq, snr, fmin_search=fmin_candidate)
     if verbose:
-        print(f"  νmax-Kandidat (SNR-Maximum): {numax_cand:.1f} μHz")
+        print(f"  νmax-Kandidat (SNR-Maximum): {numax_cand:.1f} μHz  "
+              f"[Suche ab {fmin_candidate:.1f} μHz]")
 
     # 3d: Gauß-Fit
     numax, numax_sigma = _refine_numax(freq, snr_smooth, numax_cand)
@@ -396,7 +500,12 @@ def make_figure(
 
     fig.tight_layout()
     outpath.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    try:
+        fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    except PermissionError:
+        # PDF ist noch im Viewer geöffnet (Windows-Sperre) → als PNG speichern
+        outpath = outpath.with_suffix(".png")
+        fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  → Gespeichert: {outpath}")
 
@@ -407,15 +516,17 @@ def make_figure(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Asteroseismologie-Workflow für TESS solar-like Oscillators"
+        description="Asteroseismologie-Workflow für solar-like Oscillators (TESS/Kepler/K2)"
     )
-    p.add_argument("--tic",        default=DEFAULT_TIC,   help="TESS Input Catalog ID")
+    p.add_argument("--tic",        default=DEFAULT_TIC,   help="Ziel-ID: TIC …, KIC …, oder EPIC …")
     p.add_argument("--name",       default=DEFAULT_NAME,  help="Sternname (für Ausgabe/Dateiname)")
     p.add_argument("--teff",       default=DEFAULT_TEFF,  type=float, help="Teff in K")
     p.add_argument("--fmin",       default=FMIN_UHZ,      type=float, help="Untere Frequenzgrenze (μHz)")
-    p.add_argument("--fmax",       default=FMAX_UHZ,      type=float, help="Obere Frequenzgrenze (μHz)")
+    p.add_argument("--fmax",       default=FMAX_UHZ,      type=float, help="Obere Frequenzgrenze (μHz); wird automatisch auf Nyquist gecappt")
     p.add_argument("--oversample", default=OVERSAMPLE,    type=int,   help="Oversampling-Faktor (Rechenzeit)")
-    p.add_argument("--sectors",    default=4,             type=int,   help="Max. Anzahl TESS-Sektoren")
+    p.add_argument("--sectors",    default=1,             type=int,   help="Max. Anzahl Sektoren/Quartale (Default 1)")
+    p.add_argument("--author",     default=None,          help="Datenprovider (SPOC/Kepler/K2); auto-detektiert aus TIC/KIC/EPIC-Präfix")
+    p.add_argument("--exptime",    default=None,          type=int,   help="Belichtungszeit in s (120 für TESS, 1800 für Kepler LC)")
     return p.parse_args()
 
 
@@ -432,8 +543,9 @@ def main() -> None:
     outpath   = Path("results/figures") / f"asteroseismologie_{safe_name}.pdf"
 
     # --- Schritt 1 ---
-    print("[1] Lade TESS-Lichtkurve ...")
-    lc = load_lightcurve(args.tic, max_sectors=args.sectors)
+    print("[1] Lade Lichtkurve ...")
+    lc = load_lightcurve(args.tic, max_sectors=args.sectors,
+                         author=args.author, exptime=args.exptime)
     span = lc.time.value[-1] - lc.time.value[0]
     print(f"  Zeitspanne: {span:.1f} d, {len(lc.flux)} Datenpunkte")
 
@@ -443,8 +555,10 @@ def main() -> None:
         lc, fmin_uHz=args.fmin, fmax_uHz=args.fmax, oversample=args.oversample
     )
     df = freq[1] - freq[0]
+    dt_med = float(np.median(np.diff(lc.time.value))) * 86400.0
+    nyquist = 1e6 / (2.0 * dt_med)
     print(f"  Frequenzauflösung: {df:.4f} μHz")
-    print(f"  Frequenzbereich  : {freq[0]:.1f} – {freq[-1]:.1f} μHz")
+    print(f"  Frequenzbereich  : {freq[0]:.1f} – {freq[-1]:.1f} μHz  (Nyquist: {nyquist:.0f} μHz)")
 
     # --- Schritt 3 ---
     print("\n[3] Bestimme νmax (vollautomatisch, ohne Schätzwert) ...")
