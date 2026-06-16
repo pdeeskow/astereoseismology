@@ -365,28 +365,53 @@ def estimate_numax_auto(
 # Schritt 4 — Δν via Autokorrelation
 # ===========================================================================
 
-def estimate_deltanu(freq: np.ndarray, power: np.ndarray, numax: float) -> float:
+def estimate_deltanu(
+    freq: np.ndarray, power: np.ndarray, numax: float, verbose: bool = True
+) -> float:
     """
     Schätzt Δν aus der Autokorrelation des bandgefilterten Powerspektrums.
 
-    Der initiale Suchbereich wird automatisch aus νmax abgeleitet:
-        Δν ≈ 0.263 · νmax^0.772  (Stello et al. 2009)
+    Suchfenster eng um den empirischen Prior zentriert (±20 %):
+        Δν_prior ≈ 0.263 · νmax^0.772  (Stello et al. 2009)
+
+    Enger Prior verhindert, dass die ACF Subharmonische oder Aliase
+    (z. B. Δν/√2) als Δν zurückgibt — ein häufiger Fehler bei niedrigem SNR.
+    Liegt kein ACF-Maximum im validierten Fenster, wird der Prior verwendet.
     """
-    deltanu_guess = 0.263 * numax ** 0.772
+    deltanu_prior = 0.263 * numax ** 0.772
 
-    width    = max(4 * deltanu_guess, numax * 0.5)
-    mask     = (freq > numax - width) & (freq < numax + width)
-    p_bp     = power[mask] - power[mask].mean()
+    # Bandpass um νmax für die Autokorrelation
+    width = max(4 * deltanu_prior, numax * 0.5)
+    mask  = (freq > numax - width) & (freq < numax + width)
+    p_bp  = power[mask] - power[mask].mean()
 
+    # Autokorrelation
     acf      = np.correlate(p_bp, p_bp, mode="full")
     acf      = acf[len(acf) // 2:]
     lag_freq = np.arange(len(acf)) * (freq[1] - freq[0])
 
-    mask_lag = (lag_freq > 0.5 * deltanu_guess) & (lag_freq < 2.0 * deltanu_guess)
-    if not np.any(mask_lag):
-        return deltanu_guess
+    # Enges Suchfenster: ±20 % um Skalenrelations-Prior
+    lo = 0.8 * deltanu_prior
+    hi = 1.2 * deltanu_prior
+    mask_lag = (lag_freq >= lo) & (lag_freq <= hi)
 
-    return float(lag_freq[mask_lag][np.argmax(acf[mask_lag])])
+    if verbose:
+        print(f"  Δν (Stello-Prior):   {deltanu_prior:.2f} μHz  "
+              f"→ Suchfenster [{lo:.2f}, {hi:.2f}] μHz")
+
+    if not np.any(mask_lag):
+        if verbose:
+            print(f"  Δν (ACF):            kein Peak im Fenster — Prior verwendet")
+        return deltanu_prior
+
+    deltanu_acf = float(lag_freq[mask_lag][np.argmax(acf[mask_lag])])
+
+    if verbose:
+        abw = abs(deltanu_acf - deltanu_prior) / deltanu_prior * 100
+        flag = "  ✓" if abw < 15 else f"  ⚠ {abw:.0f} % vom Prior"
+        print(f"  Δν (ACF):            {deltanu_acf:.2f} μHz{flag}")
+
+    return deltanu_acf
 
 
 # ===========================================================================
@@ -566,9 +591,8 @@ def main() -> None:
     numax        = numax_result["numax"]
 
     # --- Schritt 4 ---
-    print("\n[4] Schätze Δν (Autokorrelation) ...")
-    deltanu = estimate_deltanu(freq, power, numax)
-    print(f"  Δν = {deltanu:.2f} μHz")
+    print("\n[4] Schätze Δν (Autokorrelation mit Stello-Prior) ...")
+    deltanu = estimate_deltanu(freq, power, numax, verbose=True)
 
     # --- Schritt 5 ---
     print("\n[5] Berechne Stellar-Parameter (Skalenrelationen) ...")
