@@ -411,7 +411,58 @@ def estimate_deltanu(
         flag = "  ✓" if abw < 15 else f"  ⚠ {abw:.0f} % vom Prior"
         print(f"  Δν (ACF):            {deltanu_acf:.2f} μHz{flag}")
 
-    return deltanu_acf
+    # Échelle-Kohärenz-Verfeinerung: feines Δν-Gitter, maximiere Spaltenvarianz
+    deltanu_final = _refine_deltanu_echelle(freq, power, numax, deltanu_acf,
+                                            verbose=verbose)
+    return deltanu_final
+
+
+def _echelle_column_variance(
+    freq: np.ndarray, power: np.ndarray, numax: float,
+    deltanu: float, n_cols: int = 40
+) -> float:
+    """
+    Varianz des gefalteten Spaltenprofils — Kohärenzmaß für das Échelle.
+
+    Maximiert wenn Moden vertikal übereinander stehen (korrektes Δν).
+    """
+    flo  = max(numax - 5.0 * deltanu, freq[0])
+    fhi  = min(numax + 5.0 * deltanu, freq[-1])
+    mask = (freq >= flo) & (freq <= fhi)
+    if mask.sum() < 10:
+        return 0.0
+    x         = freq[mask] % deltanu
+    bins       = np.linspace(0, deltanu, n_cols + 1)
+    wsum, _    = np.histogram(x, bins=bins, weights=power[mask])
+    counts, _  = np.histogram(x, bins=bins)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        profile = np.where(counts > 0, wsum / counts, 0.0)
+    return float(np.var(profile))
+
+
+def _refine_deltanu_echelle(
+    freq: np.ndarray, power: np.ndarray, numax: float, deltanu_acf: float,
+    n_trial: int = 300, search_width: float = 0.15, verbose: bool = True,
+) -> float:
+    """
+    Verfeinert Δν durch Maximierung der Échelle-Kohärenz (Spaltenvarianz).
+
+    Sucht auf einem feinen Gitter von ±15 % um den ACF-Wert. Das optimale
+    Δν lässt die Oszillations-Moden in vertikalen Säulen stehen.
+    """
+    dn_lo   = deltanu_acf * (1.0 - search_width)
+    dn_hi   = deltanu_acf * (1.0 + search_width)
+    dn_grid = np.linspace(dn_lo, dn_hi, n_trial)
+
+    coherence = np.array([
+        _echelle_column_variance(freq, power, numax, dn) for dn in dn_grid
+    ])
+    deltanu_opt = float(dn_grid[np.argmax(coherence)])
+
+    if verbose:
+        print(f"  Δν (Échelle-Kohärenz): {deltanu_opt:.2f} μHz")
+
+    return deltanu_opt
 
 
 # ===========================================================================
@@ -496,17 +547,43 @@ def make_figure(
     ax.set_title("SNR-Spektrum")
     ax.legend(fontsize=8, loc="upper right")
 
-    # --- Panel 4: Échelle-Diagramm ---
-    ax = axes[1, 1]
-    flo  = numax - 5.5 * deltanu
-    fhi  = numax + 5.5 * deltanu
-    mask = (freq >= max(flo, freq[0])) & (freq <= min(fhi, freq[-1]))
-    if np.sum(mask) > 0:
-        x  = freq[mask] % deltanu
-        y  = freq[mask]
-        sc = ax.scatter(x, y, c=np.log10(power[mask]),
-                        cmap="viridis", s=2, rasterized=True)
-        plt.colorbar(sc, ax=ax, label="log PSD (ppm²/μHz)")
+    # --- Panel 4: Échelle-Diagramm (2D-Bild, geglättete PSD) ---
+    ax  = axes[1, 1]
+    df  = freq[1] - freq[0]
+    flo = max(numax - 5.5 * deltanu, freq[0])
+    fhi = min(numax + 5.5 * deltanu, freq[-1])
+    mask = (freq >= flo) & (freq <= fhi)
+
+    if np.sum(mask) > 20:
+        # 1-μHz-Glättung vor der Faltung: reduziert Rauschen, erhält Modenstruktur
+        sigma_sm = max(1, int(round(1.0 / df)))
+        p_smooth = gaussian_filter1d(power, sigma=sigma_sm)
+
+        x = freq[mask] % deltanu
+        y = freq[mask]
+
+        # 2D-Gitter: n_x Spalten (x = freq mod Δν), n_y Zeilen (y = freq)
+        n_x   = max(30, int(deltanu / df / 4))   # ~4 Bins pro μHz
+        n_y   = max(30, int((fhi - flo) / df / 4))
+        xb    = np.linspace(0, deltanu, n_x + 1)
+        yb    = np.linspace(flo, fhi,  n_y + 1)
+        H, _, _ = np.histogram2d(x, y, bins=[xb, yb],
+                                  weights=p_smooth[mask])
+        C, _, _ = np.histogram2d(x, y, bins=[xb, yb])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            grid = np.where(C > 0, H / C, np.nan)
+
+        # Leichte 2D-Glättung für saubere Ridges
+        from scipy.ndimage import gaussian_filter
+        grid_s = gaussian_filter(np.nan_to_num(grid), sigma=1.0)
+
+        im = ax.imshow(
+            np.log10(np.clip(grid_s, 1e-3 * np.nanmax(grid_s), None)).T,
+            origin="lower", aspect="auto",
+            extent=[0, deltanu, flo, fhi],
+            cmap="viridis",
+        )
+        plt.colorbar(im, ax=ax, label="log PSD (ppm²/μHz)")
     ax.set_xlabel(f"Frequenz mod {deltanu:.2f} μHz")
     ax.set_ylabel("Frequenz (μHz)")
     ax.set_title("Échelle-Diagramm")
