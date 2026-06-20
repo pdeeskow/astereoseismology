@@ -98,6 +98,24 @@ def load_lightcurve(
     author  = author  or _author
     exptime = exptime or _exptime
 
+    # Früh-Warnung: KIC-Stern mit TESS-Daten angefordert.
+    # TESS hat ~27-d-Sektoren und höheres Rauschen — ungeeignet für νmax > 280 μHz.
+    tid_upper = target_id.strip().upper()
+    if tid_upper.startswith("KIC") and author.upper() in ("SPOC", "TESS"):
+        print(
+            "\n  *** WARNUNG: TESS-Daten für KIC-Stern angefordert. ***\n"
+            "  TESS-Sektoren (~27 d) haben für νmax > 280 μHz (Unterriesen/Hauptreihe)\n"
+            "  zu kurze Basislinie und zu hohes Rauschen (~130 ppm/Kadenz vs.\n"
+            "  Oszillationsamplituden von ~5–10 ppm/Mode). Empfehlung:\n"
+            "    Kepler SC:  --author Kepler --exptime 60   (Nyquist 8333 μHz,\n"
+            "                ~30 d/Monat, mehrere Monate für gutes SNR)\n"
+        )
+
+    # Kurzkadenz-Segmente (Kepler SC: ~30 d/Monat, TESS SC: ~27 d/Sektor)
+    # sind kürzer als Kepler-LC-Quartale (~90 d) — min_span anpassen.
+    if exptime <= 120 and min_span >= 60.0:
+        min_span = 20.0
+
     search = lk.search_lightcurve(target_id, author=author, exptime=exptime)
     if len(search) == 0:
         raise ValueError(
@@ -107,37 +125,54 @@ def load_lightcurve(
             f"        --author SPOC   --exptime 120    für TESS-Sterne"
         )
 
-    # Lade etwas mehr als max_sectors, um sehr kurze Quartale (z. B. Kepler Q0
-    # mit nur ~9 d) herausfiltern zu können, ohne zu wenig Daten zu erhalten.
-    n_try = min(len(search), max_sectors + 3)
+    # Lade mehr Kandidaten als nötig, um kurze und verrauschte Segmente
+    # herausfiltern zu können (z. B. Kepler Q0 mit ~9 d, oder SC-Monate mit
+    # anomal hoher Instrumenten-Streuung durch Detektor-Wechsel).
+    n_try = min(len(search), max_sectors * 2 + 5)
     print(f"  Gefunden: {len(search)} Sektor(en)/Quartale, lade Kandidaten ...")
     lc_coll = search[:n_try].download_all(quality_bitmask="hardest")
 
-    lcs = []
-    skipped = 0
+    # Erster Durchlauf: normieren und nach Zeitspanne vorfiltern
+    candidates = []  # list of (rms_ppm, lc)
     for lc in lc_coll:
         lc_clean = lc.remove_nans().remove_outliers(sigma=4.0)
         if len(lc_clean) == 0:
-            skipped += 1
             continue
         span = float(lc_clean.time.value[-1] - lc_clean.time.value[0])
-        if span < min_span and len(lcs) == 0 and (n_try - skipped) > max_sectors:
-            # Zu kurz und wir haben noch Reservekandidaten — überspringen
-            skipped += 1
+        if span < min_span:
             print(f"  Überspringe kurzes Segment ({span:.1f} d < {min_span:.0f} d)")
             continue
         median   = float(lc_clean.flux.value.mean())
         flux_ppm = (lc_clean.flux.value / median - 1.0) * 1e6
-        lcs.append(lk.LightCurve(time=lc_clean.time, flux=flux_ppm))
-        if len(lcs) >= max_sectors:
-            break
+        rms      = float(np.std(flux_ppm))
+        candidates.append((rms, lk.LightCurve(time=lc_clean.time, flux=flux_ppm)))
 
-    if not lcs:
+    if not candidates:
         raise RuntimeError("Alle heruntergeladenen Sektoren sind leer oder zu kurz.")
 
+    # Zweiter Durchlauf: Segmente mit anomal hohem Rauschen ablehnen.
+    # Schwelle: 3× Minimum-RMS — das leiseste Segment definiert "normal";
+    # robuster als Median/Perzentil wenn die Mehrheit der Segmente verrauscht ist.
+    rms_values  = np.array([r for r, _ in candidates])
+    rms_ref     = float(np.min(rms_values))
+    rms_limit   = 3.0 * rms_ref
+    lcs = [lc for rms, lc in candidates if rms <= rms_limit]
+    n_rejected  = len(candidates) - len(lcs)
+    if n_rejected:
+        print(
+            f"  Überspringe {n_rejected} Segment(e) mit anomal hohem Rauschen "
+            f"(RMS > {rms_limit:.0f} ppm)"
+        )
+    if not lcs:
+        lcs = [lc for _, lc in candidates]  # Fallback: keines verwerfen
+
+    lcs = lcs[:max_sectors]
     print(f"  Verwende {len(lcs)} Segment(e)")
     if len(lcs) > 1:
-        return lk.LightCurveCollection(lcs).stitch()
+        # corrector_func=lambda lc: lc verhindert, dass stitch() intern
+        # nochmals normiert — unsere Segmente sind bereits in ppm (Mittelwert ≈ 0),
+        # Division durch den Median (~0) würde sonst ±∞-Artefakte erzeugen.
+        return lk.LightCurveCollection(lcs).stitch(corrector_func=lambda lc: lc)
     return lcs[0]
 
 
@@ -163,7 +198,33 @@ def compute_power_spectrum(
 
     dt_s         = float(np.median(np.diff(time_s)))
     nyquist_uHz  = 1e6 / (2.0 * dt_s)
-    fmax_uHz     = min(fmax_uHz, 0.9 * nyquist_uHz)
+
+    # Nyquist-Prüfung: frühzeitig warnen, wenn das gewünschte fmax zu hoch ist.
+    # Faustregel: νmax > 0.9 × Nyquist → Signal liegt im Aliasing-Bereich.
+    #   Kepler LC  (30 min): Nyquist ≈  278 μHz → geeignet für νmax ≤ 250 μHz (RGB)
+    #   TESS SC    ( 2 min): Nyquist ≈ 4167 μHz → Nyquist OK, aber kurze Basislinie
+    #   Kepler SC  ( 1 min): Nyquist ≈ 8333 μHz → beste Wahl für νmax > 280 μHz
+    if fmax_uHz > nyquist_uHz:
+        cadence_s = int(round(dt_s))
+        print(
+            f"\n  *** WARNUNG: fmax = {fmax_uHz:.0f} μHz übersteigt Nyquist "
+            f"({nyquist_uHz:.0f} μHz, Kadenz {cadence_s} s). ***"
+        )
+        if cadence_s >= 1700:      # Langkadenz (Kepler LC / TESS FFI ≈ 1800 s)
+            print(
+                "  Für νmax > 280 μHz zwingend Kurzkadenz verwenden:\n"
+                "    Kepler SC:  --exptime 60  (Nyquist 8333 μHz) ← empfohlen\n"
+                "    TESS SC:    --author SPOC --exptime 120        (Nyquist 4167 μHz,\n"
+                "                aber nur ~27 d Basislinie → marginale Detektierbarkeit)\n"
+            )
+        elif cadence_s <= 120:     # TESS SC
+            print(
+                "  TESS-SC-Nyquist reicht, aber 27-d-Sektoren haben oft zu wenig SNR\n"
+                "  für Sonnen-Analoga (νmax > 1000 μHz). Kepler-SC-Daten bevorzugen:\n"
+                "    --author Kepler --exptime 60\n"
+            )
+
+    fmax_uHz = min(fmax_uHz, 0.9 * nyquist_uHz)
 
     T_s      = time_s[-1] - time_s[0]
     df_uHz   = 1e6 / (oversample * T_s)
@@ -202,12 +263,35 @@ def fit_harvey_background(
     def log_harvey(f, log_a, log_b, c, log_w):
         return np.log10(_harvey_model(f, 10**log_a, 10**log_b, c, 10**log_w))
 
-    # Fit-Bereich: 2 %–15 % von fmax.
-    # Untergrenze (2 %) überspringt DC-Spike und sehr niederfrequentes Rot-Rauschen.
-    # Obergrenze (15 %) liegt für typische Rote Riesen noch unterhalb des
-    # Oszillations-Buckels (νmax > 15 % × fmax bei fmax = 300 μHz → νmax > 45 μHz).
-    i_lo = max(0, np.searchsorted(freq, freq[-1] * 0.02))
-    i_hi = np.searchsorted(freq, freq[-1] * 0.15)
+    # Fit-Bereich: adaptiv nach Nyquist-Frequenz.
+    #
+    # LC-Regime (Nyquist ≤ 400 μHz, z. B. Kepler/K2 30 min):
+    #   → 2 %–15 % von fmax  (typisch 6–45 μHz), Granulations-Knie roter
+    #     Riesen liegt bei ~10–25 μHz, gut erfasst.
+    #
+    # SC-Regime (Nyquist > 400 μHz, z. B. TESS/Kepler 2/1 min):
+    #   → 2 %–25 % von Nyquist, max. 1000 μHz.
+    #   Sonnenalogons haben ZWEI Harvey-Komponenten: Aktivität (b₁ ≈ 80 μHz)
+    #   und schnelle Granulation (b₂ ≈ 600–800 μHz). Mit einem breiteren
+    #   Fitfenster wird der effektive b zwischen beiden Komponenten ermittelt,
+    #   sodass fmin_search = 3×b_eff deutlich unter νmax bleibt.
+    nyquist_est = freq[-1] / 0.9            # freq[-1] ≈ 0.9 × Nyquist (durch Cap)
+    if nyquist_est > 400.0:
+        # SC-Regime (TESS/Kepler ≤ 2 min):
+        # Sonnenanaloga haben ZWEI Harvey-Komponenten:
+        #   Aktivität   b₁ ≈  80 μHz  (τ ≈ 2000 s)
+        #   Granulation b₂ ≈ 600 μHz  (τ ≈  250 s)
+        # Untergrenze 400 μHz  ≈ 5×b₁ → Aktivität auf <0.2 % abgefallen.
+        # Obergrenze 1000 μHz → sicher unter dem Oszillations-Buckel
+        # (νmax ≥ 1500 μHz für typische TESS-SC-Ziele).
+        f_lo_fit = 400.0
+        f_hi_fit = min(nyquist_est * 0.25, 1000.0)
+    else:
+        # LC-Regime (Kepler/K2 30 min): 2 %–15 % von fmax.
+        f_lo_fit = freq[-1] * 0.02
+        f_hi_fit = freq[-1] * 0.15
+    i_lo = max(0, np.searchsorted(freq, f_lo_fit))
+    i_hi = np.searchsorted(freq, f_hi_fit)
     if i_hi - i_lo < 30:           # Fallback wenn Bereich zu schmal
         i_lo = 0
         i_hi = max(50, int(len(freq) * 0.10))
@@ -343,6 +427,22 @@ def estimate_numax_auto(
     if verbose:
         print(f"  νmax-Kandidat (SNR-Maximum): {numax_cand:.1f} μHz  "
               f"[Suche ab {fmin_candidate:.1f} μHz]")
+
+    # Plausibilitätsprüfung: Kandidat am unteren Suchrand → Harvey-b zu groß →
+    # fmin_candidate wurde zu hoch gesetzt, echtes νmax liegt darunter oder SNR
+    # ist zu niedrig für eine valide Detektion.
+    if numax_cand < fmin_candidate * 1.05 and verbose:
+        print(
+            f"\n  *** WARNUNG: νmax-Kandidat ({numax_cand:.1f} μHz) liegt direkt an "
+            f"der Suchuntergrenze ({fmin_candidate:.1f} μHz).\n"
+            f"      Detektion ist wahrscheinlich fehlerhaft. Mögliche Ursachen:\n"
+            f"      1. Zu wenig SNR (kurze Basislinie / hohes Rauschen) —\n"
+            f"         mehr Sektoren laden: --sectors N\n"
+            f"      2. Für νmax > 280 μHz: Kepler SC ist zuverlässiger —\n"
+            f"         --author Kepler --exptime 60\n"
+            f"      3. νmax ist tatsächlich sehr niedrig (< 10 μHz) —\n"
+            f"         --fmin auf kleineren Wert setzen\n"
+        )
 
     # 3d: Gauß-Fit
     numax, numax_sigma = _refine_numax(freq, snr_smooth, numax_cand)
@@ -547,7 +647,9 @@ def make_figure(
     ax.set_title("SNR-Spektrum")
     ax.legend(fontsize=8, loc="upper right")
 
-    # --- Panel 4: Échelle-Diagramm (2D-Bild, geglättete PSD) ---
+    # --- Panel 4: Échelle-Diagramm (SNR-Spektrum, geglättet) ---
+    # Verwende SNR = PSD/Harvey statt roher PSD: Harvey-Hintergrundabfall
+    # ist herausdividiert, Modenexzess tritt relativ stärker hervor.
     ax  = axes[1, 1]
     df  = freq[1] - freq[0]
     flo = max(numax - 5.5 * deltanu, freq[0])
@@ -555,35 +657,45 @@ def make_figure(
     mask = (freq >= flo) & (freq <= fhi)
 
     if np.sum(mask) > 20:
-        # 1-μHz-Glättung vor der Faltung: reduziert Rauschen, erhält Modenstruktur
-        sigma_sm = max(1, int(round(1.0 / df)))
-        p_smooth = gaussian_filter1d(power, sigma=sigma_sm)
+        from scipy.ndimage import gaussian_filter
+
+        # Leichte 1D-Glättung: σ ≈ min(Δν/20, 1.0) μHz — kleiner als Modenbreite,
+        # nur zur Rauschunterdrückung. Zu breite Glättung (σ≥Δν/3) würde die
+        # Modenpeaks auf das gesamte Δν-Intervall verschmieren und die Ridges
+        # im Échelle unsichtbar machen; das Stapeln im 2D-Histogramm liefert
+        # selbst den SNR-Gewinn über die ~10 gestapelten Radialordnungen.
+        sigma_phys_uHz = min(deltanu / 20.0, 1.0)
+        sigma_sm  = max(2, int(round(sigma_phys_uHz / df)))
+        snr_sm    = gaussian_filter1d(numax_result["snr"], sigma=sigma_sm)
+        # Nur Exzess über Hintergrund zeigen
+        snr_excess = np.clip(snr_sm - 1.0, 0, None)
 
         x = freq[mask] % deltanu
         y = freq[mask]
 
-        # 2D-Gitter: n_x Spalten (x = freq mod Δν), n_y Zeilen (y = freq)
-        n_x   = max(30, int(deltanu / df / 4))   # ~4 Bins pro μHz
-        n_y   = max(30, int((fhi - flo) / df / 4))
-        xb    = np.linspace(0, deltanu, n_x + 1)
-        yb    = np.linspace(flo, fhi,  n_y + 1)
+        # Feines Raster: Δν/40 pro x-Bin für saubere Ridge-Auflösung
+        n_x = max(20, int(deltanu / df / 4))
+        n_y = max(20, int((fhi - flo) / 0.5))
+        xb  = np.linspace(0, deltanu, n_x + 1)
+        yb  = np.linspace(flo, fhi,  n_y + 1)
+
         H, _, _ = np.histogram2d(x, y, bins=[xb, yb],
-                                  weights=p_smooth[mask])
+                                  weights=snr_excess[mask])
         C, _, _ = np.histogram2d(x, y, bins=[xb, yb])
         with np.errstate(divide="ignore", invalid="ignore"):
-            grid = np.where(C > 0, H / C, np.nan)
+            grid = np.where(C > 0, H / C, 0.0)
 
-        # Leichte 2D-Glättung für saubere Ridges
-        from scipy.ndimage import gaussian_filter
-        grid_s = gaussian_filter(np.nan_to_num(grid), sigma=1.0)
+        # 2D-Glättung (σ=1.2 Bins) für kontinuierliche Ridges
+        grid_s = gaussian_filter(grid, sigma=1.2)
 
+        vmax = np.percentile(grid_s[grid_s > 0], 98) if grid_s.max() > 0 else 1.0
         im = ax.imshow(
-            np.log10(np.clip(grid_s, 1e-3 * np.nanmax(grid_s), None)).T,
+            grid_s.T,
             origin="lower", aspect="auto",
             extent=[0, deltanu, flo, fhi],
-            cmap="viridis",
+            cmap="hot", vmin=0, vmax=vmax,
         )
-        plt.colorbar(im, ax=ax, label="log PSD (ppm²/μHz)")
+        plt.colorbar(im, ax=ax, label="SNR − 1 (Modenexzess)")
     ax.set_xlabel(f"Frequenz mod {deltanu:.2f} μHz")
     ax.set_ylabel("Frequenz (μHz)")
     ax.set_title("Échelle-Diagramm")
@@ -666,6 +778,28 @@ def main() -> None:
     print("\n[3] Bestimme νmax (vollautomatisch, ohne Schätzwert) ...")
     numax_result = estimate_numax_auto(freq, power, verbose=True)
     numax        = numax_result["numax"]
+
+    # Nyquist-Plausibilitätsprüfung nach νmax-Bestimmung.
+    # Wenn νmax > 45 % der Nyquist-Frequenz: Ergebnis ist unsicher oder falsch.
+    nyquist_check = freq[-1] / 0.9   # freq[-1] ≈ 0.9 × Nyquist (durch Cap)
+    if numax > 0.45 * nyquist_check:
+        cadence_s = int(round(1e6 / (2.0 * nyquist_check)))
+        print(
+            f"\n  *** WARNUNG: Detektiertes νmax ({numax:.0f} μHz) liegt nahe der "
+            f"Nyquist-Grenze ({nyquist_check:.0f} μHz, Kadenz {cadence_s} s).\n"
+            f"      Ergebnis wahrscheinlich fehlerhaft. Empfehlung: ***"
+        )
+        if cadence_s >= 1700:
+            print(
+                f"      Kepler SC:  --author Kepler --exptime 60   (Nyquist 8333 μHz)\n"
+                f"      TESS SC:    --author SPOC --exptime 120     (Nyquist 4167 μHz,\n"
+                f"                  aber kurze Basislinie — Kepler bevorzugen)\n"
+            )
+        elif cadence_s <= 120:
+            print(
+                f"      Kepler SC:  --author Kepler --exptime 60   (Nyquist 8333 μHz,\n"
+                f"                  längere Basislinie, besser für νmax > 280 μHz)\n"
+            )
 
     # --- Schritt 4 ---
     print("\n[4] Schätze Δν (Autokorrelation mit Stello-Prior) ...")
