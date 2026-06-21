@@ -7,21 +7,28 @@ Stellar-Parametern (M, R, log g, L) via Skalenrelationen.
 
 Unterstützte Archive (auto-detektiert aus dem Ziel-Präfix):
   TIC …  → TESS SPOC  (2 min, Nyquist ≈ 4167 μHz)
-  KIC …  → Kepler LC  (30 min, Nyquist ≈  278 μHz)
+  KIC …  → Kepler LC  (30 min, Nyquist ≈  278 μHz)  Standard
+           Kepler SC  ( 1 min, Nyquist ≈ 8333 μHz)  --exptime 60
   EPIC … → K2 LC      (30 min, Nyquist ≈  278 μHz)
 
 νmax wird vollautomatisch bestimmt — kein Schätzwert erforderlich:
-  [1] Harvey-Hintergrundfit im Log-Raum
-  [2] SNR-Spektrum (PSD / Hintergrund)
-  [3] Erster νmax-Kandidat aus geglättetem SNR (oberhalb Harvey-Knie)
-  [4] Gauß-Fit zur finalen νmax-Bestimmung
+  [1] Harvey-Hintergrundfit im Log-Raum (adaptiver Fitbereich je nach Kadenz)
+  [2] SNR-Spektrum (PSD / Harvey-Modell)
+  [3a] Pre-Whitening: Harvey-Residuen (breitbandiger SNR-Trend) durch Division
+       durch einen Boxcar-Trendfilter (≥ 1500 μHz) entfernt → SNR-Hintergrund ≈ 1
+  [3b] Erster νmax-Kandidat aus adaptiv geglättetem, vorverweißtem SNR
+       Glättungsbreite ≈ 1–2 × Δν (automatisch: ~1/40 des Suchbereichs, mind. 15 μHz)
+       Standard: Boxcar (O(N), schnell); Option: Gauß via FFT (--gauss-smooth, O(N log N))
+  [3c] Gauß-Fit zur finalen νmax-Bestimmung
 
 Verwendung
 ----------
-    uv run asteroseismologie.py                                   # η Serpentis (Default)
-    uv run asteroseismologie.py --tic "KIC 4351319" --teff 4800   # Kepler-Roter-Riese
-    uv run asteroseismologie.py --tic "TIC 272821450" --teff 4900  # ε Ophiuchi
-    uv run asteroseismologie.py --oversample 2                     # schneller Test
+    uv run asteroseismologie.py                                               # η Serpentis (Default, TESS SC)
+    uv run asteroseismologie.py --tic "KIC 4351319" --teff 4800               # Kepler-Roter-Riese (LC)
+    uv run asteroseismologie.py --tic "KIC 3427720" --teff 5800 --exptime 60  # Kepler SC, Sonnenanaloge
+    uv run asteroseismologie.py --tic "TIC 272821450" --teff 4900              # ε Ophiuchi (TESS SC)
+    uv run asteroseismologie.py --oversample 2                                # schneller Test
+    uv run asteroseismologie.py --tic "KIC 10963065" --teff 5900 --exptime 60 --sectors 8 --gauss-smooth
 """
 from __future__ import annotations
 
@@ -38,7 +45,8 @@ import lightkurve as lk
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.timeseries import LombScargle
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, uniform_filter1d
+from scipy.signal import fftconvolve
 from scipy.optimize import curve_fit
 
 # ---------------------------------------------------------------------------
@@ -70,8 +78,12 @@ def _mission_defaults(target_id: str) -> tuple[str, int, float]:
 
     KIC  → Kepler Long Cadence (1800 s); Q0 (~9d) und Q1 (~33d) werden mit
            min_span=60d automatisch übersprungen, Q2+ (~90d) werden genutzt.
+           Für Kurzkadenz: --exptime 60 übergeben (Nyquist 8333 μHz);
+           min_span wird dann automatisch auf 20 d abgesenkt.
     EPIC → K2 Long Cadence    (1800 s); Kampagnen sind ~80 d, min_span=60d.
     sonst → TESS SPOC 2-min   (120 s);  Sektoren sind ~27 d, min_span=20d.
+           Das ist bereits Kurzkadenz; fmax wird in compute_power_spectrum()
+           automatisch auf 0.9 × Nyquist (≈ 3750 μHz) angehoben.
     """
     tid = target_id.strip().upper()
     if tid.startswith("KIC"):
@@ -142,6 +154,21 @@ def load_lightcurve(
         if span < min_span:
             print(f"  Überspringe kurzes Segment ({span:.1f} d < {min_span:.0f} d)")
             continue
+        # Trendentfernung (Savitzky-Golay): entfernt Instrumententrends und
+        # Stellarrotation (Perioden >> seismisches Signal) ohne das
+        # Oszillationssignal (Perioden von Minuten bis Stunden) zu beeinflussen.
+        # 7-Tage-Fenster: entfernt Rotationsmodulation (typisch 10–30 d),
+        # lässt jedoch alle Perioden < 7 d unberührt — das seismische Signal
+        # solarer Analoga (νmax ~3000 μHz, Periode ~5 min) und Roter Riesen
+        # (νmax ~30 μHz, Periode ~9 h) liegt weit darunter.
+        dt_sec  = float(np.median(np.diff(lc_clean.time.value))) * 86400.0
+        win_pts = int(7.0 * 86400.0 / max(dt_sec, 1.0))
+        win_pts = max(101, min(win_pts, len(lc_clean) // 3))
+        win_pts = win_pts | 1   # Savitzky-Golay benötigt ungerade Fensterlänge
+        try:
+            lc_clean = lc_clean.flatten(window_length=win_pts)
+        except Exception:
+            pass  # bei Fehler (z. B. zu kurzes Segment): kein Detrending
         median   = float(lc_clean.flux.value.mean())
         flux_ppm = (lc_clean.flux.value / median - 1.0) * 1e6
         rms      = float(np.std(flux_ppm))
@@ -198,6 +225,19 @@ def compute_power_spectrum(
 
     dt_s         = float(np.median(np.diff(time_s)))
     nyquist_uHz  = 1e6 / (2.0 * dt_s)
+
+    # Kurzkadenz-Erkennung: bei Nyquist > 400 μHz (TESS SC ≈ 4167 μHz,
+    # Kepler SC ≈ 8333 μHz) liegt fmax_uHz=300 weit unter dem Bereich
+    # solarer Oszillationen (~3000 μHz). Automatisch anheben.
+    if nyquist_uHz > 400.0 and fmax_uHz < 0.5 * nyquist_uHz:
+        fmax_auto = min(nyquist_uHz * 0.9, 8000.0)
+        print(
+            f"\n  Kurzkadenz-Datensatz erkannt (Nyquist {nyquist_uHz:.0f} μHz): "
+            f"fmax automatisch auf {fmax_auto:.0f} μHz angehoben "
+            f"(Standardwert {fmax_uHz:.0f} μHz wäre zu niedrig für νmax > 300 μHz).\n"
+            f"  Für schnellere Berechnung: --fmax {int(fmax_auto)} --oversample 2\n"
+        )
+        fmax_uHz = fmax_auto
 
     # Nyquist-Prüfung: frühzeitig warnen, wenn das gewünschte fmax zu hoch ist.
     # Faustregel: νmax > 0.9 × Nyquist → Signal liegt im Aliasing-Bereich.
@@ -281,11 +321,12 @@ def fit_harvey_background(
         # Sonnenanaloga haben ZWEI Harvey-Komponenten:
         #   Aktivität   b₁ ≈  80 μHz  (τ ≈ 2000 s)
         #   Granulation b₂ ≈ 600 μHz  (τ ≈  250 s)
-        # Untergrenze 400 μHz  ≈ 5×b₁ → Aktivität auf <0.2 % abgefallen.
-        # Obergrenze 1000 μHz → sicher unter dem Oszillations-Buckel
-        # (νmax ≥ 1500 μHz für typische TESS-SC-Ziele).
-        f_lo_fit = 400.0
-        f_hi_fit = min(nyquist_est * 0.25, 1000.0)
+        # Untergrenze 500 μHz vermeidet die Übergangszone zwischen Aktivitäts-
+        # und Granulationskomponente (100–500 μHz) vollständig.
+        # Obergrenze 1500 μHz liegt sicher unter dem Oszillations-Buckel
+        # (νmax ≥ 1500 μHz für typische SC-Ziele, ≥ 2800 μHz für Sonnenanaloga).
+        f_lo_fit = 500.0
+        f_hi_fit = min(nyquist_est * 0.20, 1500.0)
     else:
         # LC-Regime (Kepler/K2 30 min): 2 %–15 % von fmax.
         f_lo_fit = freq[-1] * 0.02
@@ -306,14 +347,26 @@ def fit_harvey_background(
     bounds_lo = [lp_lo, lf_lo, 0.5, lp_lo]
     bounds_hi = [lp_hi, lf_hi, 6.0, lp_hi]
 
+    # SC-Regime: engere physikalische Grenzen für b (Granulationsknie 200–3000 μHz)
+    # und c (Exponent ≥ 1.5 — flachere Werte gehören zum Aktivitätsrauschen,
+    # nicht zur Granulation). Verhindert, dass der Fit in das Aktivitätsregime
+    # abdriftet und einen zu kleinen b-Wert liefert.
+    if nyquist_est > 400.0:
+        bounds_lo[1] = np.log10(200.0)
+        bounds_hi[1] = np.log10(3000.0)
+        bounds_lo[2] = 1.5
+
     # Weißrauschen aus dem hohen Frequenzende schätzen
     w_guess = float(np.median(power[int(len(power) * 0.8):]))
 
+    # p0 für b: im SC-Regime mit 700 μHz initialisieren (typisches Granulations-Knie
+    # für Sonnenanaloga); allgemein bei ~10 % von fmax.
+    b_init = 700.0 if nyquist_est > 400.0 else freq[len(freq) // 10]
     p0_raw = [
-        np.log10(max(power[0], 1e-10)),          # log_a: Granulationsamplitude
-        np.log10(freq[len(freq) // 10]),          # log_b: Knie bei ~10 % von fmax
-        2.5,                                       # c: Exponent
-        np.log10(max(w_guess, 1e-10)),            # log_w: Weißrauschen
+        np.log10(max(power[0], 1e-10)),   # log_a: Granulationsamplitude
+        np.log10(b_init),                  # log_b: Granulations-Knie
+        2.5,                               # c: Exponent
+        np.log10(max(w_guess, 1e-10)),    # log_w: Weißrauschen
     ]
     eps = 1e-6
     p0 = [float(np.clip(v, bounds_lo[i] + eps, bounds_hi[i] - eps))
@@ -338,21 +391,44 @@ def _compute_snr_spectrum(power: np.ndarray, bg_model: np.ndarray) -> np.ndarray
     return power / bg_safe
 
 
+def _smooth1d_snr(arr: np.ndarray, win_bins: int, use_gaussian: bool) -> np.ndarray:
+    """
+    1D-Glättung des SNR-Spektrums: Boxcar (Standard, O(N)) oder
+    Gauß via FFT-Faltung (--gauss-smooth, O(N log N)).
+
+    Beide Varianten sind für beliebig große Fensterbreiten schnell.
+    Gauß liefert glattere Flanken ohne Gibbs-Artefakte; Boxcar ist
+    schneller und für Peak-Finding äquivalent.
+    """
+    if use_gaussian:
+        # FFT-basierte Gauß-Glättung: O(N log N), unabhängig von sigma.
+        # truncate=3 reduziert den Kernel auf 6σ (>99.7 % der Fläche).
+        hw     = int(3.0 * win_bins + 0.5)
+        k      = np.arange(-hw, hw + 1, dtype=np.float64)
+        kernel = np.exp(-0.5 * (k / win_bins) ** 2)
+        kernel /= kernel.sum()
+        return fftconvolve(arr, kernel, mode="same")
+    return uniform_filter1d(arr, size=max(1, win_bins), mode="reflect")
+
+
 def _find_numax_candidate(
     freq: np.ndarray,
     snr: np.ndarray,
     smooth_width_uHz: float = 15.0,
     fmin_search: float = 5.0,
+    use_gaussian: bool = False,
 ) -> tuple[float, np.ndarray]:
     """
-    Erster νmax-Kandidat aus dem breitbandig geglätteten SNR-Spektrum.
+    Erster νmax-Kandidat aus dem vorverweißten, geglätteten SNR-Spektrum.
 
-    15 μHz Glättungsbreite ist frequenzunabhängig und funktioniert für
-    Rote Riesen (νmax 5–300 μHz) ohne jeden Prior.
+    Erwartet das bereits vorverweißte SNR (Harvey-Trend dividiert) von
+    estimate_numax_auto. smooth_width_uHz ≈ 1–2 × Δν (adaptiv gesetzt)
+    überbrückt die Einzelmoden und macht das Hüllkurven-Maximum sichtbar.
+    use_gaussian=True (--gauss-smooth): FFT-Gauß statt Boxcar.
     """
-    df         = freq[1] - freq[0]
-    sigma_bins = max(1, round(smooth_width_uHz / df))
-    snr_smooth = gaussian_filter1d(snr, sigma=sigma_bins)
+    df       = freq[1] - freq[0]
+    win_bins = max(1, round(smooth_width_uHz / df))
+    snr_smooth = _smooth1d_snr(snr, win_bins, use_gaussian)
 
     mask = freq >= fmin_search
     idx  = np.argmax(snr_smooth[mask])
@@ -398,13 +474,14 @@ def _refine_numax(
 
 
 def estimate_numax_auto(
-    freq: np.ndarray, power: np.ndarray, verbose: bool = True
+    freq: np.ndarray, power: np.ndarray, verbose: bool = True,
+    gauss_smooth: bool = False,
 ) -> dict:
     """
     Vollautomatische νmax-Bestimmung ohne Schätzwert.
 
     Gibt dict zurück mit: numax, numax_sigma, numax_cand,
-    harvey_bg, snr, snr_smooth, harvey_params.
+    harvey_bg, snr, snr_white, snr_smooth, harvey_params.
     """
     # 3a: Harvey-Hintergrundmodell
     bg_model, harvey_params = fit_harvey_background(freq, power)
@@ -423,8 +500,30 @@ def estimate_numax_auto(
         fmin_candidate = float(np.clip(3.0 * b_harvey, 5.0, freq[-1] * 0.5))
     else:
         fmin_candidate = 5.0
-    numax_cand, snr_smooth = _find_numax_candidate(freq, snr, fmin_search=fmin_candidate)
+    # Adaptive Glättungsbreite: ~1/40 des Suchbereichs, mind. 15 μHz.
+    # ≈ 1–2 × Δν — überbrückt Einzelmoden, zeigt die Hüllkurve:
+    #   Rote Riesen  (Δν ≈  3–30 μHz, fmax ≈  250 μHz):  ~5–15 μHz → 2–5 × Δν
+    #   Sonnenanaloga(Δν ≈ 60–140 μHz, fmax ≈ 5000 μHz): ~50–150 μHz → 1–2 × Δν
+    smooth_width = max(15.0, (freq[-1] - fmin_candidate) / 40.0)
+
+    # Pre-Whitening: Harvey-Residuen (breitbandiger SNR-Abfall durch
+    # unvollständige Hintergrunderfassung bei tiefen Frequenzen) entfernen,
+    # bevor das Hüllkurven-Maximum gesucht wird.
+    # Gauss-Kern ≫ Oszillationshüllkurvenbreite (≈ 0.66·νmax^0.88 ≈ 500 μHz
+    # für Sonnenanaloga) erfasst nur den Globaltrend, nicht den Oszillationsexzess.
+    df_arr    = freq[1] - freq[0]
+    wide_phys = max(1500.0, smooth_width * 10.0)
+    wide_bins = max(1, min(round(wide_phys / df_arr), len(snr) // 2))
+    snr_trend = uniform_filter1d(snr, size=wide_bins, mode="reflect")
+    snr_white = snr / np.clip(snr_trend, 0.1, None)
+
+    numax_cand, snr_smooth = _find_numax_candidate(
+        freq, snr_white, smooth_width_uHz=smooth_width,
+        fmin_search=fmin_candidate, use_gaussian=gauss_smooth,
+    )
     if verbose:
+        filter_name = "Gauß (FFT)" if gauss_smooth else "Boxcar"
+        print(f"  SNR-Glättung   : {filter_name}, Breite {smooth_width:.1f} μHz")
         print(f"  νmax-Kandidat (SNR-Maximum): {numax_cand:.1f} μHz  "
               f"[Suche ab {fmin_candidate:.1f} μHz]")
 
@@ -451,13 +550,15 @@ def estimate_numax_auto(
               f"(σ = {numax_sigma:.1f} μHz)")
 
     return {
-        "numax":          numax,
-        "numax_sigma":    numax_sigma,
-        "numax_cand":     numax_cand,
-        "harvey_bg":      bg_model,
-        "snr":            snr,
-        "snr_smooth":     snr_smooth,
-        "harvey_params":  harvey_params,
+        "numax":           numax,
+        "numax_sigma":     numax_sigma,
+        "numax_cand":      numax_cand,
+        "harvey_bg":       bg_model,
+        "snr":             snr,
+        "snr_white":       snr_white,
+        "snr_smooth":      snr_smooth,
+        "harvey_params":   harvey_params,
+        "fmin_candidate":  fmin_candidate,
     }
 
 
@@ -635,17 +736,30 @@ def make_figure(
     ax.set_title("Powerspektrum")
     ax.legend(fontsize=8, loc="upper right")
 
-    # --- Panel 3: SNR-Spektrum ---
+    # --- Panel 3: SNR-Spektrum (vorverweißt) ---
+    # snr_white = SNR / breiter Gauss-Trend: Harvey-Residuen entfernt,
+    # Hintergrund ≈ 1.0, Oszillationsexzess sichtbar als Bump bei νmax.
     ax = axes[1, 0]
-    ax.plot(freq, numax_result["snr"], color="0.75", lw=0.5,
-            label="SNR", rasterized=True)
+    snr_disp = numax_result.get("snr_white", numax_result["snr"])
+    ax.plot(freq, snr_disp, color="0.75", lw=0.5,
+            label="SNR (normiert)", rasterized=True)
     ax.plot(freq, snr_smooth, color="C2", lw=1.8, label="SNR geglättet")
     ax.axvline(numax, color="C0", lw=1.5, ls="--",
                label=f"νmax = {numax:.1f} μHz")
     ax.set_xlabel("Frequenz (μHz)")
-    ax.set_ylabel("SNR")
+    ax.set_ylabel("SNR (normiert)")
     ax.set_title("SNR-Spektrum")
     ax.legend(fontsize=8, loc="upper right")
+    # Y-Achse: auf Oszillationsregion fokussieren
+    fmin_cand = numax_result.get("fmin_candidate", numax * 0.3)
+    mask_osc = freq >= max(fmin_cand * 0.5, freq[0])
+    if np.any(mask_osc):
+        y_lim = max(
+            float(snr_smooth[mask_osc].max()) * 3.0,
+            float(np.percentile(snr_disp[mask_osc], 99.5)) * 1.3,
+            3.0,
+        )
+        ax.set_ylim(0, y_lim)
 
     # --- Panel 4: Échelle-Diagramm (SNR-Spektrum, geglättet) ---
     # Verwende SNR = PSD/Harvey statt roher PSD: Harvey-Hintergrundabfall
@@ -741,6 +855,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sectors",    default=1,             type=int,   help="Max. Anzahl Sektoren/Quartale (Default 1)")
     p.add_argument("--author",     default=None,          help="Datenprovider (SPOC/Kepler/K2); auto-detektiert aus TIC/KIC/EPIC-Präfix")
     p.add_argument("--exptime",    default=None,          type=int,   help="Belichtungszeit in s (120 für TESS, 1800 für Kepler LC)")
+    p.add_argument("--gauss-smooth", action="store_true",
+                   help="SNR-Glättung per Gauß-FFT statt Boxcar (etwas langsamer, glattere Flanken)")
     return p.parse_args()
 
 
@@ -776,12 +892,15 @@ def main() -> None:
 
     # --- Schritt 3 ---
     print("\n[3] Bestimme νmax (vollautomatisch, ohne Schätzwert) ...")
-    numax_result = estimate_numax_auto(freq, power, verbose=True)
+    numax_result = estimate_numax_auto(freq, power, verbose=True,
+                                       gauss_smooth=args.gauss_smooth)
     numax        = numax_result["numax"]
 
     # Nyquist-Plausibilitätsprüfung nach νmax-Bestimmung.
-    # Wenn νmax > 45 % der Nyquist-Frequenz: Ergebnis ist unsicher oder falsch.
-    nyquist_check = freq[-1] / 0.9   # freq[-1] ≈ 0.9 × Nyquist (durch Cap)
+    # Wenn νmax > 45 % der echten Nyquist-Frequenz: Ergebnis ist unsicher oder falsch.
+    # Direkte Verwendung von `nyquist` (aus Lichtkurven-Kadenz) — nicht freq[-1]/0.9,
+    # da freq[-1] bei manuell gesetztem --fmax kleiner als 0.9×Nyquist sein kann.
+    nyquist_check = nyquist
     if numax > 0.45 * nyquist_check:
         cadence_s = int(round(1e6 / (2.0 * nyquist_check)))
         print(
