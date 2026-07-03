@@ -77,6 +77,11 @@ Wichtige CLI-Optionen:
 Standardmäßig wird eine PDF gespeichert. Falls die PDF unter Windows noch geöffnet
 ist (Dateisperre), schreibt das Skript automatisch eine PNG-Datei.
 
+## Weiterführende Dokumentation
+
+- Gesamtworkflow und methodische Details: [asteroseismologie_workflow.md](asteroseismologie_workflow.md)
+- Detaillierte Beschreibung der νmax-Bestimmung ohne Schätzwert: [numax_ohne_schaetzwert.md](numax_ohne_schaetzwert.md)
+
 ## Empfohlene Einstiegsziele
 
 | Stern | ID | Teff (K) | νmax (μHz) | Δν (μHz) | Mission |
