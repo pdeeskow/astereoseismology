@@ -212,6 +212,7 @@ def compute_power_spectrum(
     fmin_uHz: float = FMIN_UHZ,
     fmax_uHz: float = FMAX_UHZ,
     oversample: int = OVERSAMPLE,
+    auto_raise_sc_fmax: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Berechnet die einseitige PSD in ppm²/μHz mittels Lomb-Scargle.
@@ -227,9 +228,10 @@ def compute_power_spectrum(
     nyquist_uHz  = 1e6 / (2.0 * dt_s)
 
     # Kurzkadenz-Erkennung: bei Nyquist > 400 μHz (TESS SC ≈ 4167 μHz,
-    # Kepler SC ≈ 8333 μHz) liegt fmax_uHz=300 weit unter dem Bereich
-    # solarer Oszillationen (~3000 μHz). Automatisch anheben.
-    if nyquist_uHz > 400.0 and fmax_uHz < 0.5 * nyquist_uHz:
+    # Kepler SC ≈ 8333 μHz) liegt der Default fmax=300 weit unter dem Bereich
+    # solarer Oszillationen (~3000 μHz). Automatisch anheben nur dann,
+    # wenn kein explizites --fmax gesetzt wurde.
+    if auto_raise_sc_fmax and nyquist_uHz > 400.0 and fmax_uHz < 0.5 * nyquist_uHz:
         fmax_auto = min(nyquist_uHz * 0.9, 8000.0)
         print(
             f"\n  Kurzkadenz-Datensatz erkannt (Nyquist {nyquist_uHz:.0f} μHz): "
@@ -439,33 +441,38 @@ def _refine_numax(
     freq: np.ndarray,
     snr_smooth: np.ndarray,
     numax_cand: float,
-    band_lo_factor: float = 0.55,
-    band_hi_factor: float = 1.55,
+    smooth_width_uHz: float = 15.0,
 ) -> tuple[float, float]:
     """
-    Verfeinert den Kandidaten durch Gauß-Fit auf einem automatischen Bandpass.
+    Verfeinert den Kandidaten durch lokalen Gauß-Fit um den SNR-Peak.
 
-    Faktoren 0.55 / 1.55 sind asymmetrisch, weil die Oszillationshülle zur
-    niederfrequenten Seite steiler abfällt.
+    Ein zu breites Fitfenster kann den Mittelpunkt systematisch zu höheren
+    Frequenzen ziehen (besonders bei asymmetrischer Hülle). Daher wird der
+    Fit auf ein lokales Fenster ±(1.5 × Glättungsbreite) begrenzt.
     """
-    band_lo = numax_cand * band_lo_factor
-    band_hi = numax_cand * band_hi_factor
+    band_half = max(1.5 * smooth_width_uHz, 10.0)
+    band_lo = max(freq[0], numax_cand - band_half)
+    band_hi = min(freq[-1], numax_cand + band_half)
     mask    = (freq >= band_lo) & (freq <= band_hi)
     f_fit   = freq[mask]
     s_fit   = snr_smooth[mask]
 
+    if len(f_fit) < 8:
+        return numax_cand, max(0.5 * smooth_width_uHz, 1.0)
+
     def gauss_plus_bg(f, A, mu, sigma, c0):
         return A * np.exp(-0.5 * ((f - mu) / sigma) ** 2) + c0
 
-    p0     = [s_fit.max() - s_fit.min(), numax_cand, numax_cand * 0.25, s_fit.min()]
-    bounds = ([0, band_lo, 1.0, 0], [1e6, band_hi, band_hi - band_lo, np.inf])
+    sigma0 = max(0.8 * smooth_width_uHz, 2.0)
+    p0     = [s_fit.max() - s_fit.min(), numax_cand, sigma0, s_fit.min()]
+    bounds = ([0, band_lo, 1.0, 0], [1e6, band_hi, max(band_hi - band_lo, 2.0), np.inf])
 
     try:
         popt, _ = curve_fit(gauss_plus_bg, f_fit, s_fit, p0=p0, bounds=bounds, maxfev=5_000)
         numax_fit = float(popt[1])
         sigma_fit = float(abs(popt[2]))
         # Fit am Bandpassrand → kein echtes Maximum gefunden → Kandidat beibehalten
-        margin = 0.05 * (band_hi - band_lo)
+        margin = 0.08 * (band_hi - band_lo)
         if numax_fit < band_lo + margin or numax_fit > band_hi - margin:
             return numax_cand, numax_cand * 0.25
         return numax_fit, sigma_fit
@@ -494,10 +501,19 @@ def estimate_numax_auto(
     snr = _compute_snr_spectrum(power, bg_model)
 
     # 3c: Erster Kandidat — Suche startet oberhalb des Harvey-Knies,
-    # damit die Granulations-dominierte Region nicht als Kandidat landet.
+    # damit die granulations-dominierte Region nicht als Kandidat landet.
+    # Schutz gegen pathologischen Harvey-Fit: bei fehlangepasstem b (z. B.
+    # c am Randwert) wird der Suchstart konservativ gedeckelt.
     if harvey_params is not None:
         b_harvey = harvey_params[1]
-        fmin_candidate = float(np.clip(3.0 * b_harvey, 5.0, freq[-1] * 0.5))
+        fmin_harvey = float(np.clip(3.0 * b_harvey, 5.0, freq[-1] * 0.5))
+        fmin_cap = float(min(600.0, freq[-1] * 0.25))
+        fmin_candidate = min(fmin_harvey, fmin_cap)
+        if verbose and fmin_harvey > fmin_cap:
+            print(
+                f"  Hinweis: Harvey-Suchstart ({fmin_harvey:.1f} μHz) wurde auf "
+                f"{fmin_cap:.1f} μHz gedeckelt (robuste Kandidatensuche)."
+            )
     else:
         fmin_candidate = 5.0
     # Adaptive Glättungsbreite: ~1/40 des Suchbereichs, mind. 15 μHz.
@@ -544,7 +560,12 @@ def estimate_numax_auto(
         )
 
     # 3d: Gauß-Fit
-    numax, numax_sigma = _refine_numax(freq, snr_smooth, numax_cand)
+    numax, numax_sigma = _refine_numax(
+        freq,
+        snr_smooth,
+        numax_cand,
+        smooth_width_uHz=smooth_width,
+    )
     if verbose:
         print(f"  νmax final  (Gauß-Fit):      {numax:.1f} μHz  "
               f"(σ = {numax_sigma:.1f} μHz)")
@@ -613,8 +634,14 @@ def estimate_deltanu(
         print(f"  Δν (ACF):            {deltanu_acf:.2f} μHz{flag}")
 
     # Échelle-Kohärenz-Verfeinerung: feines Δν-Gitter, maximiere Spaltenvarianz
-    deltanu_final = _refine_deltanu_echelle(freq, power, numax, deltanu_acf,
-                                            verbose=verbose)
+    deltanu_final = _refine_deltanu_echelle(
+        freq,
+        power,
+        numax,
+        deltanu_acf,
+        deltanu_prior=deltanu_prior,
+        verbose=verbose,
+    )
     return deltanu_final
 
 
@@ -641,8 +668,82 @@ def _echelle_column_variance(
     return float(np.var(profile))
 
 
+def _echelle_ridge_slope(
+    freq: np.ndarray,
+    power: np.ndarray,
+    numax: float,
+    deltanu: float,
+    n_orders: int = 10,
+    n_cols: int = 80,
+) -> float:
+    """
+    Signierte Ridge-Steigung im Échelle-Diagramm in μHz pro Ordnung.
+
+    Ziel ist eine möglichst gerade Ridge (Steigung nahe 0). Das Vorzeichen
+    wird für eine lokale Nullstellen-Korrektur im Δν-Raster genutzt.
+    """
+    flo  = max(numax - 5.0 * deltanu, freq[0])
+    fhi  = min(numax + 5.0 * deltanu, freq[-1])
+    mask = (freq >= flo) & (freq <= fhi)
+    if np.sum(mask) < 200:
+        return float("nan")
+
+    f = freq[mask]
+    p = power[mask]
+
+    # Nur Modenexzess gewichten, damit Hintergrund die Ridge-Lage nicht verzerrt.
+    p_ex = np.clip(p - np.percentile(p, 65), 0.0, None)
+    if not np.any(p_ex > 0):
+        return float("nan")
+
+    order_idx = np.floor((f - flo) / deltanu).astype(int)
+    valid_ord = (order_idx >= 0) & (order_idx < n_orders)
+    if not np.any(valid_ord):
+        return float("nan")
+
+    x = f % deltanu
+    bins = np.linspace(0.0, deltanu, n_cols + 1)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+
+    k_vals: list[int] = []
+    x_peaks: list[float] = []
+    for k in range(n_orders):
+        mk = valid_ord & (order_idx == k)
+        if np.sum(mk) < 20:
+            continue
+        wsum, _   = np.histogram(x[mk], bins=bins, weights=p_ex[mk])
+        counts, _ = np.histogram(x[mk], bins=bins)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            profile = np.where(counts > 0, wsum / counts, 0.0)
+        if np.all(profile <= 0):
+            continue
+        x_pk = float(centers[int(np.argmax(profile))])
+        k_vals.append(k)
+        x_peaks.append(x_pk)
+
+    if len(x_peaks) < 4:
+        return float("nan")
+
+    # Modulo-Unwrap für stetigen Ridge-Verlauf zwischen Ordnungen.
+    x_arr = np.array(x_peaks, dtype=float)
+    for i in range(1, len(x_arr)):
+        d = x_arr[i] - x_arr[i - 1]
+        if d > 0.5 * deltanu:
+            x_arr[i] -= deltanu
+        elif d < -0.5 * deltanu:
+            x_arr[i] += deltanu
+
+    k_arr = np.array(k_vals, dtype=float)
+    slope, _ = np.polyfit(k_arr, x_arr, 1)
+    return float(slope)
+
+
 def _refine_deltanu_echelle(
-    freq: np.ndarray, power: np.ndarray, numax: float, deltanu_acf: float,
+    freq: np.ndarray,
+    power: np.ndarray,
+    numax: float,
+    deltanu_acf: float,
+    deltanu_prior: float,
     n_trial: int = 300, search_width: float = 0.15, verbose: bool = True,
 ) -> float:
     """
@@ -658,10 +759,64 @@ def _refine_deltanu_echelle(
     coherence = np.array([
         _echelle_column_variance(freq, power, numax, dn) for dn in dn_grid
     ])
-    deltanu_opt = float(dn_grid[np.argmax(coherence)])
+    ridge_slope = np.array([
+        _echelle_ridge_slope(freq, power, numax, dn) for dn in dn_grid
+    ])
+
+    # 1) Basisschätzer: Maximum der Échelle-Kohärenz.
+    i_coh = int(np.argmax(coherence))
+    dn_coh = float(dn_grid[i_coh])
+
+    # 2) Lokale Ridge-Korrektur: falls nahe dn_coh ein Vorzeichenwechsel der
+    # Ridge-Steigung vorliegt, lineare Nullstelle bestimmen.
+    # Das reduziert systematische Schieflage im Échelle (sichtbar geneigte Ridges).
+    dn_flat = dn_coh
+    coh_max = float(np.max(coherence))
+    coh_min_for_slope = 0.70 * coh_max
+
+    # Nachbarsuche links/rechts um i_coh
+    i_left = None
+    i_right = None
+    s0 = ridge_slope[i_coh]
+    if np.isfinite(s0):
+        for j in range(i_coh - 1, -1, -1):
+            if coherence[j] < coh_min_for_slope or not np.isfinite(ridge_slope[j]):
+                continue
+            if ridge_slope[j] == 0 or ridge_slope[j] * s0 < 0:
+                i_left = j
+                break
+        for j in range(i_coh + 1, len(dn_grid)):
+            if coherence[j] < coh_min_for_slope or not np.isfinite(ridge_slope[j]):
+                continue
+            if ridge_slope[j] == 0 or ridge_slope[j] * s0 < 0:
+                i_right = j
+                break
+
+    # Nächstes gültiges Vorzeichenwechsel-Paar verwenden.
+    pick = None
+    if i_left is not None and i_right is not None:
+        pick = i_left if (i_coh - i_left) <= (i_right - i_coh) else i_right
+    elif i_left is not None:
+        pick = i_left
+    elif i_right is not None:
+        pick = i_right
+
+    if pick is not None and np.isfinite(ridge_slope[pick]) and np.isfinite(s0):
+        x1, y1 = float(dn_grid[i_coh]), float(s0)
+        x2, y2 = float(dn_grid[pick]), float(ridge_slope[pick])
+        if abs(y2 - y1) > 1e-12:
+            dn_zero = x1 - y1 * (x2 - x1) / (y2 - y1)
+            dn_flat = float(np.clip(dn_zero, dn_grid[0], dn_grid[-1]))
+
+    # 3) Endschätzer: Kohärenzdominiert, aber mit kleiner Ridge- und Prior-Korrektur.
+    dn_blend = 0.70 * dn_coh + 0.30 * dn_flat
+    deltanu_opt = float(0.85 * dn_blend + 0.15 * deltanu_prior)
 
     if verbose:
-        print(f"  Δν (Échelle-Kohärenz): {deltanu_opt:.2f} μHz")
+        print(
+            f"  Δν (Échelle-Kohärenz+Ridge): {deltanu_opt:.2f} μHz  "
+            f"(Kohärenz-Peak {dn_coh:.2f}, Ridge-Korr. {dn_flat:.2f})"
+        )
 
     return deltanu_opt
 
@@ -882,7 +1037,11 @@ def main() -> None:
     # --- Schritt 2 ---
     print("\n[2] Berechne Powerspektrum ...")
     freq, power = compute_power_spectrum(
-        lc, fmin_uHz=args.fmin, fmax_uHz=args.fmax, oversample=args.oversample
+        lc,
+        fmin_uHz=args.fmin,
+        fmax_uHz=args.fmax,
+        oversample=args.oversample,
+        auto_raise_sc_fmax=bool(np.isclose(args.fmax, FMAX_UHZ)),
     )
     df = freq[1] - freq[0]
     dt_med = float(np.median(np.diff(lc.time.value))) * 86400.0
