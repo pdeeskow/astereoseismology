@@ -47,7 +47,7 @@ import numpy as np
 from astropy.timeseries import LombScargle
 from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from scipy.signal import fftconvolve
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, least_squares
 
 # ---------------------------------------------------------------------------
 # Solarkonstanten (Referenzwerte)
@@ -289,16 +289,49 @@ def _harvey_model(f: np.ndarray, a: float, b: float, c: float, w: float) -> np.n
     return a / (1.0 + (f / b) ** c) + w
 
 
+def _double_harvey_model(
+    f: np.ndarray,
+    a1: float,
+    b1: float,
+    c1: float,
+    a2: float,
+    b2: float,
+    c2: float,
+    w: float,
+) -> np.ndarray:
+    """Harvey-Hintergrund mit langsamer und schneller Granulationskomponente."""
+    return (
+        a1 / (1.0 + (f / b1) ** c1)
+        + a2 / (1.0 + (f / b2) ** c2)
+        + w
+    )
+
+
+def _log_bin_psd(freq: np.ndarray, power: np.ndarray, n_bins: int = 100) -> tuple[np.ndarray, np.ndarray]:
+    """Fasst eine stark streuende PSD robust in logarithmischen Frequenzbins zusammen."""
+    edges = np.geomspace(max(float(freq[0]), 1e-3), float(freq[-1]), n_bins + 1)
+    bin_index = np.digitize(freq, edges) - 1
+    f_binned = []
+    p_binned = []
+    median_to_mean = 1.0 / np.log(2.0)
+    for index in range(n_bins):
+        mask = bin_index == index
+        if np.count_nonzero(mask) < 5:
+            continue
+        f_binned.append(float(np.exp(np.mean(np.log(freq[mask])))))
+        p_binned.append(float(np.median(power[mask]) * median_to_mean))
+    return np.asarray(f_binned), np.asarray(p_binned)
+
+
 def fit_harvey_background(
     freq: np.ndarray, power: np.ndarray
-) -> tuple[np.ndarray, tuple[float, float, float, float] | None]:
+) -> tuple[np.ndarray, tuple[float, ...] | None]:
     """
     Passt das Harvey-Modell im Log-Raum an das Powerspektrum.
 
-    Fit erfolgt nur auf dem unteren 10 % des Frequenzbereichs (mindestens
-    50 Bins), wo die Granulation dominiert und der Oszillations-Buckel
-    noch nicht stört. Das gefittete Modell wird auf den vollen Bereich
-    extrapoliert. Damit wird b nicht durch den Oszillationsexzess verzerrt.
+    Im LC-Regime wird ein Harvey-Term im tiefen Frequenzbereich angepasst.
+    Im SC-Regime werden zwei Komponenten an eine logarithmisch gebinnte PSD
+    angepasst, damit Aktivität und schnelle Granulation getrennt erfasst werden.
     """
     log_power = np.log10(np.clip(power, 1e-10, None))
 
@@ -319,27 +352,57 @@ def fit_harvey_background(
     #   sodass fmin_search = 3×b_eff deutlich unter νmax bleibt.
     nyquist_est = freq[-1] / 0.9            # freq[-1] ≈ 0.9 × Nyquist (durch Cap)
     if nyquist_est > 400.0:
-        # SC-Regime (TESS/Kepler ≤ 2 min):
-        # Sonnenanaloga haben ZWEI Harvey-Komponenten:
-        #   Aktivität   b₁ ≈  80 μHz  (τ ≈ 2000 s)
-        #   Granulation b₂ ≈ 600 μHz  (τ ≈  250 s)
-        # Untergrenze 500 μHz vermeidet die Übergangszone zwischen Aktivitäts-
-        # und Granulationskomponente (100–500 μHz) vollständig.
-        # Obergrenze 1500 μHz liegt sicher unter dem Oszillations-Buckel
-        # (νmax ≥ 1500 μHz für typische SC-Ziele, ≥ 2800 μHz für Sonnenanaloga).
-        f_lo_fit = 500.0
-        f_hi_fit = min(nyquist_est * 0.20, 1500.0)
+        f_binned, p_binned = _log_bin_psd(freq, power)
+        log_p_binned = np.log10(np.clip(p_binned, 1e-10, None))
+        log_w_init = float(np.log10(np.median(p_binned[-max(5, len(p_binned) // 8):])))
+        log_p_low = float(np.log10(max(p_binned[0], 1e-10)))
+        log_p_mid = float(np.log10(max(np.median(p_binned[len(p_binned) // 3:len(p_binned) // 2]), 1e-10)))
+
+        def residuals(params):
+            log_a1, log_b1, c1, log_a2, log_b2, c2, log_w = params
+            model = _double_harvey_model(
+                f_binned,
+                10**log_a1, 10**log_b1, c1,
+                10**log_a2, 10**log_b2, c2,
+                10**log_w,
+            )
+            return np.log10(model) - log_p_binned
+
+        p0 = [
+            log_p_low, np.log10(30.0), 2.5,
+            log_p_mid, np.log10(min(500.0, freq[-1] * 0.25)), 3.0,
+            log_w_init,
+        ]
+        lower = [
+            log_power.min() - 1.0, np.log10(max(freq[0], 1.0)), 1.5,
+            log_power.min() - 1.0, np.log10(200.0), 1.5,
+            log_power.min() - 1.0,
+        ]
+        upper = [
+            log_power.max() + 1.0, np.log10(min(200.0, freq[-1] * 0.25)), 6.0,
+            log_power.max() + 1.0, np.log10(min(3000.0, freq[-1])), 6.0,
+            log_power.max() + 1.0,
+        ]
+        try:
+            result = least_squares(
+                residuals, p0, bounds=(lower, upper), loss="soft_l1",
+                f_scale=0.08, max_nfev=20_000,
+            )
+            log_a1, log_b1, c1, log_a2, log_b2, c2, log_w = result.x
+            params = (
+                10**log_a1, 10**log_b1, c1,
+                10**log_a2, 10**log_b2, c2,
+                10**log_w,
+            )
+            return _double_harvey_model(freq, *params), params
+        except (RuntimeError, ValueError):
+            sigma = max(1, len(freq) // 10)
+            return gaussian_filter1d(power, sigma=sigma), None
     else:
-        # LC-Regime (Kepler/K2 30 min): 2 %–15 % von fmax.
-        f_lo_fit = freq[-1] * 0.02
-        f_hi_fit = freq[-1] * 0.15
-    i_lo = max(0, np.searchsorted(freq, f_lo_fit))
-    i_hi = np.searchsorted(freq, f_hi_fit)
-    if i_hi - i_lo < 30:           # Fallback wenn Bereich zu schmal
-        i_lo = 0
-        i_hi = max(50, int(len(freq) * 0.10))
-    f_bg   = freq[i_lo:i_hi]
-    lp_bg  = log_power[i_lo:i_hi]
+        # LC-Regime: ein Term genügt, aber das hohe Frequenzende wird für eine
+        # belastbare Bestimmung des Weißrauschplateaus benötigt.
+        f_bg, p_bg = _log_bin_psd(freq, power, n_bins=80)
+        lp_bg = np.log10(np.clip(p_bg, 1e-10, None))
 
     # Datengetriebene Bounds (über gesamtes Spektrum für Extrapolations-Stabilität)
     lp_lo = log_power.min() - 1.0
@@ -493,9 +556,16 @@ def estimate_numax_auto(
     # 3a: Harvey-Hintergrundmodell
     bg_model, harvey_params = fit_harvey_background(freq, power)
     if verbose and harvey_params:
-        a, b, c, w = harvey_params
-        print(f"  Harvey-Fit : a={a:.0f} ppm²/μHz  b={b:.1f} μHz  "
-              f"c={c:.2f}  w={w:.1f} ppm²/μHz")
+        if len(harvey_params) == 7:
+            a1, b1, c1, a2, b2, c2, w = harvey_params
+            print(
+                f"  Harvey-Fit : b1={b1:.1f} μHz  c1={c1:.2f}  "
+                f"b2={b2:.1f} μHz  c2={c2:.2f}  w={w:.1f} ppm²/μHz"
+            )
+        else:
+            a, b, c, w = harvey_params
+            print(f"  Harvey-Fit : a={a:.0f} ppm²/μHz  b={b:.1f} μHz  "
+                  f"c={c:.2f}  w={w:.1f} ppm²/μHz")
 
     # 3b: SNR-Spektrum
     snr = _compute_snr_spectrum(power, bg_model)
@@ -505,7 +575,7 @@ def estimate_numax_auto(
     # Schutz gegen pathologischen Harvey-Fit: bei fehlangepasstem b (z. B.
     # c am Randwert) wird der Suchstart konservativ gedeckelt.
     if harvey_params is not None:
-        b_harvey = harvey_params[1]
+        b_harvey = harvey_params[4] if len(harvey_params) == 7 else harvey_params[1]
         fmin_harvey = float(np.clip(3.0 * b_harvey, 5.0, freq[-1] * 0.5))
         fmin_cap = float(min(600.0, freq[-1] * 0.25))
         fmin_candidate = min(fmin_harvey, fmin_cap)

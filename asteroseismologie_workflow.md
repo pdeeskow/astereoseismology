@@ -259,7 +259,7 @@ Konvektive Granulation erzeugt ein Lorentzian-förmiges Rausch-Spektrum,
 das Harvey-Modell genannt wird:
 
 $$
-B(f) = \frac{a}{1 + (f/b)^c} + w
+B(f) = \sum_i \frac{a_i}{1 + (f/b_i)^{c_i}} + w
 $$
 
 - $a$ — Granulations-Amplitude (ppm²/μHz)
@@ -267,9 +267,9 @@ $$
 - $c$ — Exponent (typisch 2–4; bei Roter Riese ≈ 2, bei Sonnenanaloga ≈ 4)
 - $w$ — Weißrauschen-Plateau (Photonrauschen, Instrumentenrauschen)
 
-Für Sonnenanaloga gibt es tatsächlich zwei Harvey-Terme (Aktivitäts- und
-Granulationskomponente), die Pipeline verwendet aber einen effektiven
-Einzel-Fit, der für die νmax-Lokalisation ausreichend ist.
+Im LC-Regime genügt ein Harvey-Term. Im SC-Regime verwendet die Pipeline
+zwei geordnete Terme für die langsame Aktivitäts-/Granulationskomponente
+und die schnelle Granulation.
 
 **Fit-Strategie:**
 Der Fit erfolgt im Log-Raum (`log₁₀(PSD)` vs. `f`), weil das die
@@ -280,13 +280,16 @@ Der Fit-Bereich ist adaptiv und wird durch die Nyquist-Frequenz gesteuert:
 
 | Regime | Nyquist | Fit-Bereich | Begründung |
 |--------|---------|-------------|------------|
-| LC | ≤ 400 μHz | 2 %–15 % von fmax | Granulations-Knie roter Riesen bei 10–25 μHz |
-| SC | > 400 μHz | 500–1500 μHz | Vermeidet Aktivitätsregime (<500 μHz) und Oszillationsbuckel (>1500 μHz) |
+| LC | ≤ 400 μHz | gesamter Frequenzbereich, logarithmisch gebinnt | Bestimmt Granulationsknie und Weißrauschplateau gemeinsam |
+| SC | > 400 μHz | gesamter Frequenzbereich, logarithmisch gebinnt | Erfasst beide Knie auch bei Unterriesen mit νmax < 1500 μHz |
 
-Im SC-Regime gelten engere physikalische Grenzen:
-- b: 200–3000 μHz (nur Granulationsbereich, kein Aktivitätsrauschen)
-- c: ≥ 1.5 (flachere Exponenten gehören zur Aktivität)
-- Startwert b = 700 μHz (typisches Granulations-Knie sonnenähnlicher Sterne)
+Im SC-Regime wird die stark streuende PSD zunächst in 100 logarithmischen
+Frequenzbins durch den Median zusammengefasst. Die Medianwerte werden auf den
+Erwartungswert einer exponentiell verteilten PSD korrigiert. Ein robuster
+Least-Squares-Fit mit `soft_l1`-Verlust reduziert anschließend den Einfluss
+des Oszillationsbuckels und einzelner Ausreißer. Die Knie sind durch
+$b_1 < 200\,\mu\mathrm{Hz}$ und $b_2 > 200\,\mu\mathrm{Hz}$ geordnet;
+für beide Exponenten gilt $1.5 \le c \le 6$.
 
 Fällt der Fit fehl (z. B. zu wenig Frequenzpunkte), wird eine breit
 geglättete PSD als Fallback-Hintergrund verwendet.
@@ -497,12 +500,11 @@ die Rotationsmodulation und Aktivitätssignal das SNR-Plateau anheben
 und den Harvey-Fit erschweren. Die 7-Tage-Detrending-Fenster hilft,
 entfernt aber keine Aktivitäts-Signale mit Perioden < 7 d.
 
-### Einkanaliges Harvey-Modell
-Die Pipeline verwendet einen einzigen Harvey-Term. Für Sonnenanaloga
-existieren zwei Granulationskomponenten (Aktivität b₁ ≈ 80 μHz,
-schnelle Granulation b₂ ≈ 600 μHz). Das Einzel-Modell findet einen
-effektiven Kompromiss-Wert, was zu höheren fmin_search-Werten führen
-kann und die νmax-Lokalisierung für diese Sterne erschwert.
+### Harvey-Modell bei SC-Daten
+Die Pipeline verwendet für SC-Daten zwei Harvey-Terme. Sehr starke oder
+ungewöhnlich breite Oszillationsbuckel können den robusten Hintergrundfit
+weiterhin beeinflussen; für Präzisionsanalysen ist ein gemeinsamer
+Bayes-Hintergrund- und Hüllkurvenfit vorzuziehen.
 
 ### Kepler SC: hohe Ausdünnung der Daten
 Bei Kepler SC werden mit dem `hardest`-Qualitätsmask 20–28 % der
@@ -529,7 +531,7 @@ Die Pipeline warnt in diesem Fall und empfiehlt Kurzkadenz-Daten.
 ## Weiterführende Schritte
 
 ### Verbesserte νmax-Bestimmung
-- **Zwei-Komponenten Harvey-Fit** für Sonnenanaloga (Aktivität + Granulation)
+- **Gemeinsamer Background-/Oszillationsfit** statt sequenzieller Anpassung
 - **Bayes'scher Background-Fit** (z. B. mit DIAMONDS/FAMED)
 - **Ensembles**: νmax aus mehreren Sektoren/Quartalen gemittelt
 
