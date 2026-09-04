@@ -17,10 +17,7 @@ data/cache/*
 !data/cache/.gitkeep
 
 # Erzeugte Ergebnisse — lokal reproduzierbar, nicht einchecken
-results/figures/*
-results/tables/*
-!results/figures/.gitkeep
-!results/tables/.gitkeep
+results/
 
 # VS Code
 .vscode/
