@@ -19,6 +19,7 @@ von der Lichtkurve bis zu abgeleiteten Stellar-Parametern.
 - Δν-Schätzung aus ACF (Stello-Prior) plus Échelle-Kohärenz/Ridge-Refinement
 - Skalenrelationen für M, R, log g, L
 - Ausgabe als 4-Panel-Figur (Lichtkurve, PSD+Harvey, SNR, Échelle)
+- Zusätzliches repliziertes Échelle mit farbcodierten l=0/1/2-Modenkandidaten
 
 ## Voraussetzungen
 
@@ -68,14 +69,19 @@ Wichtige CLI-Optionen:
 - --fmin, --fmax: Frequenzbereich in μHz
 - --oversample: Frequenzauflösung vs. Laufzeit
 - --gauss-smooth: Gauß-Glättung statt Boxcar
+- --echelle-replicas: Zwei oder drei horizontale Échelle-Kopien (Standard: 2)
 
 ## Ausgabe
 
 - Cache: data/cache/
 - Figuren: results/figures/
 
-Standardmäßig wird eine PDF gespeichert. Falls die PDF unter Windows noch geöffnet
-ist (Dateisperre), schreibt das Skript automatisch eine PNG-Datei.
+Standardmäßig werden die 4-Panel-Übersicht und ein repliziertes Échelle als
+separate PDF-Dateien gespeichert. Das replizierte Diagramm markiert automatisch
+extrahierte Kandidaten für l=0 (blau), l=1 (grün), l=2 (orange) und unklare bzw.
+gemischte Moden (grau). Die Zuordnung aus der Échelle-Position ist diagnostisch
+und ersetzt kein wissenschaftliches Peak-Bagging. Falls eine PDF unter Windows
+noch geöffnet ist (Dateisperre), schreibt das Skript automatisch eine PNG-Datei.
 
 ## Weiterführende Dokumentation
 

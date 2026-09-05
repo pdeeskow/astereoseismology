@@ -46,7 +46,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from astropy.timeseries import LombScargle
 from scipy.ndimage import gaussian_filter1d, uniform_filter1d
-from scipy.signal import fftconvolve
+from scipy.signal import fftconvolve, find_peaks
 from scipy.optimize import curve_fit, least_squares
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,14 @@ DEFAULT_TEFF = 4970.0            # K  (SIMBAD)
 FMIN_UHZ   = 1.0
 FMAX_UHZ   = 300.0
 OVERSAMPLE = 5
+
+L_COLORS = {0: "#185FA5", 1: "#0F9E66", 2: "#D85A30", -1: "#999999"}
+L_LABELS = {
+    0: "l=0 (radial)",
+    1: "l=1 (dipol, gemischt)",
+    2: "l=2 (quadrupol)",
+    -1: "unklar/gemischt",
+}
 
 
 # ===========================================================================
@@ -914,6 +922,135 @@ def scaling_relations(numax: float, deltanu: float, teff: float) -> dict:
     return {"mass": mass, "radius": radius, "logg": logg, "lumin": lumin}
 
 
+def extract_oscillation_modes(
+    freq: np.ndarray,
+    snr: np.ndarray,
+    numax: float,
+    deltanu: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extrahiert signifikante lokale SNR-Maxima im Oszillationsbereich."""
+    df = float(freq[1] - freq[0])
+    mask = (freq >= numax - 5.5 * deltanu) & (freq <= numax + 5.5 * deltanu)
+    freq_osc = freq[mask]
+    snr_osc = snr[mask]
+    if len(freq_osc) < 20:
+        return np.array([]), np.array([])
+
+    sigma_bins = max(1, int(round(min(deltanu / 80.0, 0.3) / df)))
+    snr_sm = gaussian_filter1d(snr_osc, sigma=sigma_bins)
+    excess = np.clip(snr_sm - 1.0, 0.0, None)
+    positive = excess[excess > 0]
+    if len(positive) == 0:
+        return np.array([]), np.array([])
+
+    prominence = max(float(np.percentile(positive, 60)) * 0.35, 0.03)
+    min_distance = max(1, int(round(0.025 * deltanu / df)))
+    peaks, properties = find_peaks(
+        excess,
+        prominence=prominence,
+        distance=min_distance,
+    )
+    if len(peaks) == 0:
+        return np.array([]), np.array([])
+
+    amplitudes = properties["prominences"]
+    if len(peaks) > 80:
+        keep = np.argsort(amplitudes)[-80:]
+        peaks = peaks[keep]
+        amplitudes = amplitudes[keep]
+    order = np.argsort(freq_osc[peaks])
+    return freq_osc[peaks][order], amplitudes[order]
+
+
+def classify_l_by_position(
+    freq_modes: np.ndarray,
+    amp_modes: np.ndarray,
+    deltanu: float,
+    d02_rel: float = 0.12,
+) -> tuple[np.ndarray, float]:
+    """Ordnet Peaks anhand automatisch geschätzter Échelle-Positionen l zu."""
+    if len(freq_modes) == 0:
+        return np.array([], dtype=int), 0.0
+
+    phase = (freq_modes % deltanu) / deltanu
+    weights = amp_modes / max(float(np.max(amp_modes)), np.finfo(float).eps)
+    candidates = np.linspace(0.0, 1.0, 720, endpoint=False)
+
+    def circular_distance(values: np.ndarray, target: float) -> np.ndarray:
+        delta = np.abs(values - target)
+        return np.minimum(delta, 1.0 - delta)
+
+    scores = np.empty_like(candidates)
+    for index, eps0 in enumerate(candidates):
+        l0 = np.exp(-0.5 * (circular_distance(phase, eps0) / 0.055) ** 2)
+        l2 = np.exp(-0.5 * (circular_distance(phase, (eps0 - d02_rel) % 1.0) / 0.055) ** 2)
+        l1 = np.exp(-0.5 * (circular_distance(phase, (eps0 + 0.5) % 1.0) / 0.10) ** 2)
+        scores[index] = np.sum(weights * (l0 + 0.75 * l2 + 0.45 * l1))
+    eps0 = float(candidates[np.argmax(scores)])
+
+    targets = np.array([eps0, (eps0 + 0.5) % 1.0, (eps0 - d02_rel) % 1.0])
+    degrees = np.array([0, 1, 2])
+    tolerances = np.array([0.075, 0.16, 0.075])
+    distances = np.column_stack([circular_distance(phase, target) for target in targets])
+    nearest = np.argmin(distances, axis=1)
+    labels = np.full(len(freq_modes), -1, dtype=int)
+    accepted = distances[np.arange(len(freq_modes)), nearest] <= tolerances[nearest]
+    labels[accepted] = degrees[nearest[accepted]]
+    return labels, eps0
+
+
+def plot_replicated_echelle(
+    freq_modes: np.ndarray,
+    amp_modes: np.ndarray,
+    labels: np.ndarray,
+    deltanu: float,
+    numax: float,
+    star_name: str,
+    outpath: Path,
+    n_replicas: int = 2,
+) -> None:
+    """Speichert ein repliziertes Échelle mit farbcodierten Modengraden."""
+    fig, ax = plt.subplots(figsize=(7, 9))
+    x_base = freq_modes % deltanu
+    amp_scale = amp_modes / max(float(np.max(amp_modes)), np.finfo(float).eps)
+
+    for degree in (0, 1, 2, -1):
+        mode_mask = labels == degree
+        if not np.any(mode_mask):
+            continue
+        for replica in range(n_replicas):
+            ax.scatter(
+                x_base[mode_mask] + replica * deltanu,
+                freq_modes[mode_mask],
+                s=20.0 + 180.0 * amp_scale[mode_mask],
+                c=L_COLORS[degree],
+                alpha=0.78,
+                edgecolors="white",
+                linewidths=0.4,
+                label=L_LABELS[degree] if replica == 0 else None,
+                zorder=3 if degree in (1, -1) else 2,
+            )
+
+    for replica in range(1, n_replicas):
+        ax.axvline(replica * deltanu, color="0.5", lw=0.7, ls="--", alpha=0.5)
+    ax.axhline(numax, color="#D97706", lw=1.0, ls=":", alpha=0.75,
+               label=f"νmax = {numax:.1f} μHz")
+    ax.set_xlim(0.0, n_replicas * deltanu)
+    ax.set_xlabel(f"Frequenz mod Δν  (Δν = {deltanu:.2f} μHz)")
+    ax.set_ylabel("Frequenz (μHz)")
+    ax.set_title(f"{star_name}: repliziertes Échelle ({n_replicas}×)")
+    ax.legend(fontsize=8, loc="upper right", framealpha=0.9)
+    fig.tight_layout()
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    except PermissionError:
+        outpath = outpath.with_suffix(".png")
+        fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → Gespeichert: {outpath}")
+
+
 # ===========================================================================
 # Schritt 6 — Abbildungen
 # ===========================================================================
@@ -1082,6 +1219,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--exptime",    default=None,          type=int,   help="Belichtungszeit in s (120 für TESS, 1800 für Kepler LC)")
     p.add_argument("--gauss-smooth", action="store_true",
                    help="SNR-Glättung per Gauß-FFT statt Boxcar (etwas langsamer, glattere Flanken)")
+    p.add_argument("--echelle-replicas", default=2, type=int, choices=(2, 3),
+                   help="Anzahl horizontaler Kopien im replizierten Échelle (2 oder 3)")
     return p.parse_args()
 
 
@@ -1096,6 +1235,7 @@ def main() -> None:
     lk.conf.cache_path = "data/cache"
     safe_name = args.name.replace(" ", "_").replace("/", "-").replace("η", "eta").replace("ε", "eps")
     outpath   = Path("results/figures") / f"asteroseismologie_{safe_name}.pdf"
+    replicated_outpath = Path("results/figures") / f"asteroseismologie_{safe_name}_echelle_repliziert.pdf"
 
     # --- Schritt 1 ---
     print("[1] Lade Lichtkurve ...")
@@ -1164,6 +1304,30 @@ def main() -> None:
     # --- Schritt 6 ---
     print("\n[6] Erstelle Abbildung ...")
     make_figure(lc, freq, power, numax_result, deltanu, params, args.name, outpath)
+
+    freq_modes, amp_modes = extract_oscillation_modes(
+        freq, numax_result.get("snr_white", numax_result["snr"]), numax, deltanu
+    )
+    labels, eps0 = classify_l_by_position(freq_modes, amp_modes, deltanu)
+    print(
+        f"  Extrahierte Moden: {len(freq_modes)} "
+        f"(l=0: {np.sum(labels == 0)}, l=1: {np.sum(labels == 1)}, "
+        f"l=2: {np.sum(labels == 2)}, unklar: {np.sum(labels == -1)}; "
+        f"ε₀={eps0:.3f})"
+    )
+    if len(freq_modes) > 0:
+        plot_replicated_echelle(
+            freq_modes,
+            amp_modes,
+            labels,
+            deltanu,
+            numax,
+            args.name,
+            replicated_outpath,
+            n_replicas=args.echelle_replicas,
+        )
+    else:
+        print("  Kein repliziertes Échelle erzeugt: keine signifikanten Moden gefunden.")
 
     print(f"\n{sep}\n")
 
