@@ -284,8 +284,10 @@ def compute_power_spectrum(
     ls    = LombScargle(time_s, flux_ppm, normalization="psd")
     power = ls.power(freq_Hz)
 
-    # Einseitige PSD, Parseval-normiert
-    return freq_uHz, power * 2.0 / df_uHz
+    # Astropys normalization="psd" summiert bei Fourier-Frequenzen auf
+    # N/2 × Varianz. Division durch N und df ergibt eine einseitige
+    # Leistungsdichte, deren Integral der Lichtkurvenvarianz entspricht.
+    return freq_uHz, power * 2.0 / (len(time_s) * df_uHz)
 
 
 # ===========================================================================
@@ -1221,6 +1223,24 @@ def _parse_args() -> argparse.Namespace:
                    help="SNR-Glättung per Gauß-FFT statt Boxcar (etwas langsamer, glattere Flanken)")
     p.add_argument("--echelle-replicas", default=2, type=int, choices=(2, 3),
                    help="Anzahl horizontaler Kopien im replizierten Échelle (2 oder 3)")
+    p.add_argument("--pbjam", action="store_true",
+                   help="PBjam >= 2.0 für ModeID und Peakbagging verwenden (optional)")
+    p.add_argument("--pbjam-numax-sigma", type=float, default=None,
+                   help="νmax-Unsicherheit für PBjam in μHz (Default: Gauß-Fit)")
+    p.add_argument("--pbjam-deltanu-sigma", type=float, default=None,
+                   help="Δν-Unsicherheit für PBjam in μHz (Default: 1 %% von Δν)")
+    p.add_argument("--teff-sigma", type=float, default=100.0,
+                   help="Teff-Unsicherheit für PBjam in K (Default: 100)")
+    p.add_argument("--bp-rp", type=float, default=None,
+                   help="Optionale Gaia-Farbe BP-RP für den PBjam-Prior")
+    p.add_argument("--bp-rp-sigma", type=float, default=0.05,
+                   help="Unsicherheit von BP-RP für PBjam (Default: 0.05 mag)")
+    p.add_argument("--pbjam-orders", type=int, default=7,
+                   help="Anzahl radialer Ordnungen für PBjam (Default: 7)")
+    p.add_argument("--pbjam-quality-min", type=float, default=2.0,
+                   help="Minimales Prior-/Posterior-Breitenverhältnis (Default: 2)")
+    p.add_argument("--pbjam-refresh", action="store_true",
+                   help="Vorhandenen PBjam-Cache ignorieren und Sampling neu ausführen")
     return p.parse_args()
 
 
@@ -1305,16 +1325,52 @@ def main() -> None:
     print("\n[6] Erstelle Abbildung ...")
     make_figure(lc, freq, power, numax_result, deltanu, params, args.name, outpath)
 
-    freq_modes, amp_modes = extract_oscillation_modes(
-        freq, numax_result.get("snr_white", numax_result["snr"]), numax, deltanu
-    )
-    labels, eps0 = classify_l_by_position(freq_modes, amp_modes, deltanu)
-    print(
-        f"  Extrahierte Moden: {len(freq_modes)} "
-        f"(l=0: {np.sum(labels == 0)}, l=1: {np.sum(labels == 1)}, "
-        f"l=2: {np.sum(labels == 2)}, unklar: {np.sum(labels == -1)}; "
-        f"ε₀={eps0:.3f})"
-    )
+    if args.pbjam:
+        from pbjam_bridge import (
+            filter_reliable_modes,
+            find_avoided_crossings,
+            run_pbjam_modeid,
+        )
+
+        numax_sigma = args.pbjam_numax_sigma or numax_result["numax_sigma"]
+        deltanu_sigma = args.pbjam_deltanu_sigma or 0.01 * deltanu
+        modes = run_pbjam_modeid(
+            freq,
+            power,
+            numax=(numax, numax_sigma),
+            deltanu=(deltanu, deltanu_sigma),
+            teff=(args.teff, args.teff_sigma),
+            bp_rp=(args.bp_rp, args.bp_rp_sigma) if args.bp_rp is not None else None,
+            star_id=args.tic,
+            n_orders=args.pbjam_orders,
+            force=args.pbjam_refresh,
+        )
+        reliable_modes = filter_reliable_modes(modes, args.pbjam_quality_min)
+        freq_modes = reliable_modes["freq"]
+        amp_modes = reliable_modes["height"]
+        labels = reliable_modes["l"]
+        print(
+            f"  PBjam-Moden: {len(modes['freq'])} insgesamt, {len(freq_modes)} zuverlässig "
+            f"(l=0: {np.sum(labels == 0)}, l=1: {np.sum(labels == 1)}, "
+            f"l=2: {np.sum(labels == 2)}; Qualität > {args.pbjam_quality_min:g})"
+        )
+        crossings = find_avoided_crossings(freq_modes[labels == 1], deltanu)
+        if len(crossings["crossings"]):
+            crossing_text = ", ".join(f"{value:.2f}" for value in crossings["crossings"])
+            print(f"  Kandidaten für avoided crossings: {crossing_text} μHz")
+        else:
+            print("  Keine avoided-crossing-Kandidaten in den zuverlässigen l=1-Moden.")
+    else:
+        freq_modes, amp_modes = extract_oscillation_modes(
+            freq, numax_result.get("snr_white", numax_result["snr"]), numax, deltanu
+        )
+        labels, eps0 = classify_l_by_position(freq_modes, amp_modes, deltanu)
+        print(
+            f"  Extrahierte Moden: {len(freq_modes)} "
+            f"(l=0: {np.sum(labels == 0)}, l=1: {np.sum(labels == 1)}, "
+            f"l=2: {np.sum(labels == 2)}, unklar: {np.sum(labels == -1)}; "
+            f"ε₀={eps0:.3f})"
+        )
     if len(freq_modes) > 0:
         plot_replicated_echelle(
             freq_modes,

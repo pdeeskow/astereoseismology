@@ -20,6 +20,7 @@ von der Lichtkurve bis zu abgeleiteten Stellar-Parametern.
 - Skalenrelationen für M, R, log g, L
 - Ausgabe als 4-Panel-Figur (Lichtkurve, PSD+Harvey, SNR, Échelle)
 - Zusätzliches repliziertes Échelle mit farbcodierten l=0/1/2-Modenkandidaten
+- Optionale Bayesianische Modenidentifikation und Peakbagging mit PBjam >= 2.0
 
 ## Voraussetzungen
 
@@ -31,6 +32,12 @@ von der Lichtkurve bis zu abgeleiteten Stellar-Parametern.
 
 ```bash
 uv sync
+```
+
+Für die optionale PBjam-Integration:
+
+```bash
+uv sync --extra pbjam
 ```
 
 ## Verwendung
@@ -51,6 +58,9 @@ uv run asteroseismologie.py --tic "KIC 10963065" --name "KIC 10963065" --teff 59
 # Alternativer SNR-Glätter (Gauß via FFT)
 uv run asteroseismologie.py --gauss-smooth
 
+# PBjam ModeID + Peakbagging mit Gaia-Farbe
+uv run asteroseismologie.py --tic "KIC 10273246" --name "Mulder" --teff 6150 --exptime 60 --sectors 8 --pbjam --bp-rp 0.60
+
 # Schneller Test
 uv run asteroseismologie.py --oversample 2
 
@@ -70,11 +80,19 @@ Wichtige CLI-Optionen:
 - --oversample: Frequenzauflösung vs. Laufzeit
 - --gauss-smooth: Gauß-Glättung statt Boxcar
 - --echelle-replicas: Zwei oder drei horizontale Échelle-Kopien (Standard: 2)
+- --pbjam: PBjam ModeID und Peakbagging aktivieren (sonst unveränderter schneller Modus)
+- --pbjam-numax-sigma, --pbjam-deltanu-sigma, --teff-sigma: Unsicherheiten der PBjam-Priors
+- --bp-rp, --bp-rp-sigma: Optionale Gaia-Farbe mit Unsicherheit
+- --pbjam-orders: Anzahl modellierter radialer Ordnungen (Standard: 7)
+- --pbjam-quality-min: Mindestwert des Prior-/Posterior-Breitenverhältnisses (Standard: 2)
+- --pbjam-refresh: Vorhandenen Ergebnis-Cache ignorieren
 
 ## Ausgabe
 
 - Cache: data/cache/
 - Figuren: results/figures/
+- PBjam-Ergebnisse und Cache: results/pbjam/
+- PBjam-Modentabellen: results/tables/
 
 Standardmäßig werden die 4-Panel-Übersicht und ein repliziertes Échelle als
 separate PDF-Dateien gespeichert. Das replizierte Diagramm markiert automatisch
@@ -82,6 +100,9 @@ extrahierte Kandidaten für l=0 (blau), l=1 (grün), l=2 (orange) und unklare bz
 gemischte Moden (grau). Die Zuordnung aus der Échelle-Position ist diagnostisch
 und ersetzt kein wissenschaftliches Peak-Bagging. Falls eine PDF unter Windows
 noch geöffnet ist (Dateisperre), schreibt das Skript automatisch eine PNG-Datei.
+Mit `--pbjam` werden stattdessen die Bayesianischen PBjam-Labels und
+Peakbagging-Höhen verwendet. Identische Eingaben laden automatisch den JSON-Cache;
+`--pbjam-refresh` erzwingt einen neuen, potenziell lang laufenden Sampling-Lauf.
 
 ## Weiterführende Dokumentation
 
@@ -102,6 +123,7 @@ noch geöffnet ist (Dateisperre), schreibt das Skript automatisch eine PNG-Datei
 ```text
 asteroseismology/
 |- asteroseismologie.py
+|- pbjam_bridge.py
 |- asteroseismologie_workflow.md
 |- numax_ohne_schaetzwert.md
 |- pyproject.toml
