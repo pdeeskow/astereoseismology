@@ -1,0 +1,291 @@
+targets:
+  - id: "Sun"
+    label: "Sonne"
+    stage: "Hauptreihe (Referenz)"
+    status: "reference"
+    literature_only: true
+    analysis:
+      teff: 5778
+    reference:
+      numax: 3090.0
+      deltanu: 135.1
+      d02: 9.0
+      source: "Chaplin & Miglio 2013, ARA&A 51, 353"
+
+  - id: "KIC 12069424"
+    label: "16 Cyg A"
+    stage: "Hauptreihe, sonnenaehnlich"
+    status: "pending"
+    analysis:
+      teff: 5800
+      teff_sigma: 50
+      exptime: 60
+      sectors: 9
+      oversample: 2
+      pbjam: true
+      bp_rp: 0.813247       # Gaia DR3 2135550755684503680
+      bp_rp_sigma: 0.05
+    reference:
+      numax: 2188.5
+      numax_sigma: 4.6
+      deltanu: 103.56
+      deltanu_sigma: 0.10
+      mass: 1.07
+      mass_sigma: 0.05
+      radius: 1.22
+      radius_sigma: 0.02
+      luminosity: 1.56
+      age_gyr: 7.0
+      age_gyr_sigma: 0.3
+      gaia_dr3: "2135550755684503680"
+      gaia_gmag: 5.818
+      gaia_teff: 5665.9
+      source: "Metcalfe et al. 2012 ApJL 748 L10; Metcalfe et al. 2015 (AMP); White et al. 2013 (CHARA); Deal et al. 2015 (Delta-nu); Gaia DR3 (I/355)"
+      note: "Davies et al. 2015: 54 Moden aus 928 d short cadence. Gleiches Alter wie 16 Cyg B."
+
+  - id: "KIC 12069449"
+    label: "16 Cyg B"
+    stage: "Hauptreihe, Begleiter"
+    status: "pending"
+    analysis:
+      teff: 5750
+      teff_sigma: 50
+      exptime: 60
+      sectors: 9
+      oversample: 2
+      pbjam: true
+      bp_rp: 0.826160       # Gaia DR3 2135550755683407232
+      bp_rp_sigma: 0.05
+    reference:
+      numax: 2561.3
+      numax_sigma: 5.6
+      deltanu: 117.17
+      deltanu_sigma: 0.10
+      mass: 1.05
+      mass_sigma: 0.04
+      radius: 1.12
+      radius_sigma: 0.02
+      luminosity: 1.27
+      age_gyr: 7.0
+      age_gyr_sigma: 0.3
+      gaia_dr3: "2135550755683407232"
+      gaia_gmag: 6.073
+      gaia_teff: 5639.6
+      source: "Metcalfe et al. 2012 ApJL 748 L10; Metcalfe et al. 2015; White et al. 2013 (CHARA); Deal et al. 2015; Gaia DR3 (I/355)"
+      note: "Davies et al. 2015: 56 Moden. Exoplanet ~1.5 M_Jup. Separation zu A: 39.6 arcsec."
+
+  - id: "KIC 10963065"
+    label: "KIC 10963065"
+    stage: "frueher Unterriese"
+    status: "analyzed"
+    analysis:
+      teff: 6140
+      teff_sigma: 77
+      exptime: 60
+      sectors: 8
+      oversample: 2
+      pbjam: true
+      bp_rp: 0.70026
+      bp_rp_sigma: 0.05
+    reference:
+      numax: 2145.0
+      deltanu: 103.11
+      source: "OFFEN - im Lund et al. 2017 Legacy-Katalog (ApJ 835, 172) nachschlagen"
+      note: "TESS-2min ungeeignet - Moden bei 2145 uHz nicht detektierbar. Nur Kepler short cadence."
+
+  - id: "KIC 10920273"
+    label: "Scully"
+    stage: "Unterriese"
+    status: "pending"
+    analysis:
+      teff: 5790            # Creevey et al. 2012; Gaia gspphot gibt 5604 K
+      teff_sigma: 100
+      exptime: 60
+      sectors: 8
+      oversample: 2
+      pbjam: true
+      bp_rp: 0.863844       # Gaia DR3 2129284295319984768
+      bp_rp_sigma: 0.05
+    reference:
+      numax: 990.0
+      numax_sigma: 60.0
+      deltanu: 57.27
+      deltanu_sigma: 0.13
+      d02: 4.76
+      d02_sigma: 0.14
+      mode_range: [826.0, 1227.0]
+      n_modes: 21
+      n_avoided_crossings: 1
+      gaia_dr3: "2129284295319984768"
+      gaia_gmag: 11.861
+      gaia_teff: 5604.4
+      source: "Campante et al. 2011 A&A 534 A6; Creevey et al. 2012 A&A 537 A111 Tab. 2; Gaia DR3 (I/355)"
+      note: "Ein avoided crossing sicher, ein weiteres wahrscheinlich. Zehn unabhaengige Pipelines."
+
+  - id: "KIC 10273246"
+    label: "Mulder"
+    stage: "entwickelter Unterriese"
+    status: "analyzed"
+    analysis:
+      teff: 6150
+      teff_sigma: 100
+      exptime: 60
+      sectors: 8
+      oversample: 2
+      pbjam: true
+      bp_rp: 0.60
+      bp_rp_sigma: 0.05
+    reference:
+      numax: 838.0
+      numax_sigma: 50.0
+      deltanu: 48.89
+      deltanu_sigma: 0.09
+      d02: 4.40
+      d02_sigma: 0.44
+      mode_range: [737.0, 1080.0]
+      n_modes: 30
+      n_avoided_crossings: 2
+      source: "Campante et al. 2011 A&A 534 A6; Creevey et al. 2012 A&A 537 A111 Tab. 2"
+
+  # ══════════════════════════════════════════════════════════════════
+  #  Referenzwerte grundlegend korrigiert (war: numax ~47, dnu ~4.7).
+  #  Primaerquelle Di Mauro et al. 2011: numax = 386.5 uHz.
+  #  SHORT CADENCE zwingend - numax liegt ueber der Long-Cadence-
+  #  Nyquistgrenze von 283 uHz. Nicht im Yu-2018-Katalog enthalten.
+  # ══════════════════════════════════════════════════════════════════
+  - id: "KIC 4351319"
+    label: "KIC 4351319 (Pooh)"
+    stage: "niedrigleuchtender RGB"
+    status: "pending"
+    analysis:
+      teff: 4700            # Di Mauro et al. 2011, McDonald-Spektroskopie R=65000
+      teff_sigma: 50
+      exptime: 60           # KORRIGIERT: short cadence
+      sectors: 1            # nur 30 d short cadence verfuegbar
+      fmin: 100.0
+      fmax: 700.0
+      oversample: 5
+      pbjam: true
+      bp_rp: 1.171373       # Gaia DR3 2100417167287796992
+      bp_rp_sigma: 0.05
+    reference:
+      numax: 386.5
+      numax_sigma: 4.0
+      deltanu: 24.6
+      deltanu_sigma: 0.2
+      d02: 2.2
+      d02_sigma: 0.3
+      mode_range: [300.0, 500.0]
+      n_modes: 25
+      delta_pi1: 40.0       # +/- 4 s -> RGB-Signatur (H-Schalenbrennen)
+      delta_pi1_sigma: 4.0
+      teff: 4700
+      teff_sigma: 50
+      logg: 3.3
+      logg_sigma: 0.1
+      feh: 0.23
+      feh_sigma: 0.15
+      mass: 1.30            # Frequenzmodellierung (ASTEC/ADIPLS)
+      mass_sigma: 0.03
+      radius: 3.37
+      radius_sigma: 0.03
+      luminosity: 5.1
+      luminosity_sigma: 0.2
+      age_gyr: 5.6
+      age_gyr_sigma: 0.4
+      vmag: 10.19
+      vsini: 6.0
+      gaia_dr3: "2100417167287796992"
+      gaia_gmag: 9.956
+      source: "Di Mauro et al. 2011, MNRAS 415, 3783 (arXiv:1105.1076); Gaia DR3 (I/355)"
+      note: >
+        30 d short cadence (Q3.1), Duty Cycle 97%, Nyquist 8497 uHz.
+        25 Moden l=0,1,2 zwischen 300 und 500 uHz. Long cadence NICHT
+        verwendbar (Nyquist 283 uHz). Am Fuss des aufsteigenden RGB,
+        H-Schalenbrennen. Periodenspacing 40+/-4 s bestaetigt RGB.
+        Starkes Mode Bumping bei l=1 - g- und p-Modenabstaende
+        vergleichbar, daher schwer messbares Periodenspacing.
+
+  # ══════════════════════════════════════════════════════════════════
+  #  RGB/RC-Paar aus Basu & Hekker 2020 (Abb. 12).
+  #  Fast identisches Delta-nu (4.085 vs 4.108), aber verschiedene
+  #  Brennphasen - nur ueber das Periodenspacing unterscheidbar.
+  #  Das ist der didaktische Kern des Atlas.
+  # ══════════════════════════════════════════════════════════════════
+  - id: "KIC 1161618"
+    label: "KIC 1161618"
+    stage: "Red Clump (He-Kernbrennen)"
+    status: "pending"
+    analysis:
+      teff: 4747            # Yu et al. 2018
+      teff_sigma: 150
+      exptime: 1800
+      sectors: 18           # Quarter; 1318.10 d Abdeckung
+      oversample: 5
+      pbjam: true
+      bp_rp: 1.263046       # Gaia DR3 2050254968627140736
+      bp_rp_sigma: 0.05
+    reference:
+      numax: 34.32
+      deltanu: 4.108
+      teff: 4747
+      feh: 0.08
+      logg: 2.441
+      mass: 1.20            # Clump-korrigiert (ClcorM)
+      radius: 10.92         # Clump-korrigiert (ClcorR)
+      mass_nocorr: 1.19
+      radius_nocorr: 10.89
+      amplitude_ppm: 121.7
+      width: 14.4
+      granulation: 2954.8
+      kpmag: 10.220
+      phase: 2              # Yu-Flag: 2 = He-Kernbrennen (Clump)
+      delta_pi1: null       # OFFEN - erwartet 150-300 s (RC-Signatur)
+      gaia_dr3: "2050254968627140736"
+      gaia_gmag: 10.173
+      gaia_teff: 4565.9
+      source: "Yu et al. 2018 ApJS 236 42 (VizieR J/ApJS/236/42); Basu & Hekker 2020 Front. Astron. Space Sci. 7, 44 Abb. 12; Gaia DR3 (I/355)"
+      note: >
+        Referenzbeispiel fuer Red Clump im Review von Basu & Hekker 2020,
+        dort direkt gegen KIC 1433730 (RGB) gestellt. Einzelstern,
+        keine Binaritaet. Phase-Flag 2 bestaetigt He-Kernbrennen.
+        RC-Powerspektren wirken verrauschter als RGB - hoehere
+        Granulationsleistung bei gleichem Radius (Mathur+ 2011).
+
+  - id: "KIC 1433730"
+    label: "KIC 1433730"
+    stage: "RGB (Vergleichspartner zu KIC 1161618)"
+    status: "pending"
+    analysis:
+      teff: 4767            # Yu et al. 2018
+      teff_sigma: 150
+      exptime: 1800
+      sectors: 18
+      oversample: 5
+      pbjam: true
+      bp_rp: 1.412063       # Gaia DR3 2051703957457531264
+      bp_rp_sigma: 0.05
+    reference:
+      numax: 40.37
+      deltanu: 4.085
+      teff: 4767
+      feh: -0.06
+      logg: 2.513
+      mass: 1.84            # RGB-korrigiert (RGBcorM)
+      radius: 12.45         # RGB-korrigiert (RGBcorR)
+      mass_nocorr: 2.00
+      radius_nocorr: 12.98
+      amplitude_ppm: 65.8
+      width: 15.6
+      granulation: 1418.1
+      kpmag: 10.890
+      phase: 1              # Yu-Flag: 1 = RGB (H-Schalenbrennen)
+      delta_pi1: null       # OFFEN - erwartet 50-80 s (RGB-Signatur)
+      gaia_dr3: "2051703957457531264"
+      gaia_gmag: 10.869
+      source: "Yu et al. 2018 ApJS 236 42 (VizieR J/ApJS/236/42); Basu & Hekker 2020 Abb. 12; Gaia DR3 (I/355)"
+      note: >
+        Bildet mit KIC 1161618 das entscheidende Paar: Delta-nu 4.085
+        gegenueber 4.108 - praktisch identisch. Nur das Periodenspacing
+        Delta-Pi-1 trennt RGB von Clump. Das ist das Kernargument fuer
+        die Notwendigkeit gemischter Moden in der Klassifikation.

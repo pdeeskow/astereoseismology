@@ -285,15 +285,24 @@ def _extract_modes(st) -> dict:
     return modes
 
 
-def filter_reliable_modes(modes: dict, quality_min: float = 2.0) -> dict:
-    """
-    Filtert auf Moden, bei denen das Spektrum den Prior dominiert.
+def adaptive_quality_threshold(modes: dict, factor: float = 1.10,
+                               floor: float = 0.75,
+                               ceiling: float = 2.0) -> float:
+    """Leitet den Quality-Cut aus dem Median der endlichen Werte ab."""
+    quality = np.asarray(modes["quality"], dtype=float)
+    quality = quality[np.isfinite(quality)]
+    if not len(quality):
+        return floor
+    return float(np.clip(np.median(quality) * factor, floor, ceiling))
 
-    Nach Nielsen et al. (2021): Moden mit Prior/Posterior-Breitenverhältnis
-    > ~2 sind solche, bei denen die Daten (nicht der Prior) die Frequenz
-    bestimmen. Diese sind für wissenschaftliche Aussagen zu bevorzugen.
-    """
-    mask = modes["quality"] > quality_min
+
+def filter_reliable_modes(modes: dict, quality_min: float | None = None,
+                          height_min: float = 1.0) -> dict:
+    """Filtert gemeinsam nach informativem Posterior und messbarer Höhe."""
+    if quality_min is None:
+        quality_min = adaptive_quality_threshold(modes)
+    mask = ((modes["quality"] >= quality_min)
+            & (modes["height"] >= height_min))
     return {k: (v[mask] if isinstance(v, np.ndarray) else v)
             for k, v in modes.items()}
 ```

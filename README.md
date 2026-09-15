@@ -68,6 +68,30 @@ uv run asteroseismologie.py --oversample 2
 uv run asteroseismologie.py --help
 ```
 
+Die Einzelstern-CLI bleibt unabhängig von der Atlas-Konfiguration vollständig
+nutzbar. Für einen seriellen, wiederaufnehmbaren Atlaslauf:
+
+```bash
+# Bereits analysierte Targets aus config/targets.yaml
+uv run python -m atlas.run_all
+
+# Einzelnes ausstehendes Target erstmals analysieren
+uv run python -m atlas.run_all --target "KIC 4351319"
+
+# Bereits geprüften PBjam-Alt-Cache bei einer Migration explizit übernehmen
+uv run python -m atlas.run_all --target "KIC 10963065" --reuse-existing-pbjam --no-legacy-figures
+
+# Atlasplots ausschließlich aus vorhandenen Ergebnisartefakten erzeugen
+uv run python -m atlas.generate_plots
+```
+
+Atlas-Ergebnisse liegen pro Stern unter `results/atlas/<target>/`. Ein
+`summary.json` enthält Messwerte, Unsicherheiten, Qualitätsflags und Provenienz;
+`diagnostics.npz` hält die Arrays für reproduzierbare Folgeauswertungen. Manuell
+geprüfte Δν-Werte sind nur als begründeter `deltanu_override` in der
+Target-Konfiguration zulässig. KIC 4351319 ist derzeit als noch nicht untersucht
+(`pending`) markiert.
+
 Wichtige CLI-Optionen:
 
 - --tic: Ziel-ID (TIC..., KIC..., EPIC...)
@@ -84,7 +108,7 @@ Wichtige CLI-Optionen:
 - --pbjam-numax-sigma, --pbjam-deltanu-sigma, --teff-sigma: Unsicherheiten der PBjam-Priors
 - --bp-rp, --bp-rp-sigma: Optionale Gaia-Farbe mit Unsicherheit
 - --pbjam-orders: Anzahl modellierter radialer Ordnungen (Standard: 7)
-- --pbjam-quality-min: Mindestwert des Prior-/Posterior-Breitenverhältnisses (Standard: 2)
+- --pbjam-quality-min: Optionaler fester Quality-Cut; standardmäßig adaptiv (Median × 1.10, begrenzt auf 0.75 bis 2.0)
 - --pbjam-refresh: Vorhandenen Ergebnis-Cache ignorieren
 
 ## Ausgabe

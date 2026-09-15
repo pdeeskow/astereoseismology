@@ -49,6 +49,9 @@ from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from scipy.signal import fftconvolve, find_peaks
 from scipy.optimize import curve_fit, least_squares
 
+from atlas_metrics import crossing_candidates, measure_d02
+from atlas_models import AtlasResult, QCFlag, TargetConfig
+
 # ---------------------------------------------------------------------------
 # Solarkonstanten (Referenzwerte)
 # ---------------------------------------------------------------------------
@@ -1237,30 +1240,71 @@ def _parse_args() -> argparse.Namespace:
                    help="Unsicherheit von BP-RP für PBjam (Default: 0.05 mag)")
     p.add_argument("--pbjam-orders", type=int, default=7,
                    help="Anzahl radialer Ordnungen für PBjam (Default: 7)")
-    p.add_argument("--pbjam-quality-min", type=float, default=2.0,
-                   help="Minimales Prior-/Posterior-Breitenverhältnis (Default: 2)")
+    p.add_argument("--pbjam-quality-min", type=float, default=None,
+                   help="Fester PBjam-Quality-Cut (Default: adaptiv aus der Qualitätsverteilung)")
     p.add_argument("--pbjam-refresh", action="store_true",
                    help="Vorhandenen PBjam-Cache ignorieren und Sampling neu ausführen")
+    p.add_argument("--reuse-existing-pbjam", action="store_true",
+                   help="Vorhandenen geprüften PBjam-Cache trotz Signaturabweichung übernehmen")
     return p.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
+def _target_config_from_args(args: argparse.Namespace) -> TargetConfig:
+    """Übersetzt die bestehende CLI verlustfrei in den gemeinsamen Analysevertrag."""
+    return TargetConfig(
+        id=args.tic,
+        label=args.name,
+        stage="nicht angegeben",
+        teff=args.teff,
+        teff_sigma=args.teff_sigma,
+        author=args.author,
+        exptime=args.exptime,
+        sectors=args.sectors,
+        fmin=args.fmin,
+        fmax=args.fmax,
+        oversample=args.oversample,
+        gauss_smooth=args.gauss_smooth,
+        echelle_replicas=args.echelle_replicas,
+        pbjam=args.pbjam,
+        pbjam_numax_sigma=args.pbjam_numax_sigma,
+        pbjam_deltanu_sigma=args.pbjam_deltanu_sigma,
+        pbjam_orders=args.pbjam_orders,
+        pbjam_quality_min=args.pbjam_quality_min,
+        pbjam_refresh=args.pbjam_refresh,
+        pbjam_reuse_existing=args.reuse_existing_pbjam,
+        bp_rp=args.bp_rp,
+        bp_rp_sigma=args.bp_rp_sigma,
+    )
 
+
+def _atlas_output_dir(target_id: str) -> Path:
+    stem = "_".join(target_id.strip().split()).replace("/", "-")
+    return Path("results/atlas") / stem
+
+
+def analyze_target(
+    config: TargetConfig,
+    *,
+    write_atlas: bool = False,
+    legacy_outputs: bool = True,
+) -> AtlasResult:
+    """Analysiert einen Stern für CLI oder Atlas mit demselben Rechenpfad."""
+    if config.literature_only:
+        raise ValueError("Literaturziele besitzen keine ausführbare Lichtkurvenanalyse.")
     sep = "=" * 60
     print(f"\n{sep}")
-    print(f"  Astroseismologie-Workflow: {args.name}")
+    print(f"  Astroseismologie-Workflow: {config.label}")
     print(f"{sep}\n")
 
     lk.conf.cache_path = "data/cache"
-    safe_name = args.name.replace(" ", "_").replace("/", "-").replace("η", "eta").replace("ε", "eps")
+    safe_name = config.label.replace(" ", "_").replace("/", "-").replace("η", "eta").replace("ε", "eps")
     outpath   = Path("results/figures") / f"asteroseismologie_{safe_name}.pdf"
     replicated_outpath = Path("results/figures") / f"asteroseismologie_{safe_name}_echelle_repliziert.pdf"
 
     # --- Schritt 1 ---
     print("[1] Lade Lichtkurve ...")
-    lc = load_lightcurve(args.tic, max_sectors=args.sectors,
-                         author=args.author, exptime=args.exptime)
+    lc = load_lightcurve(config.id, max_sectors=config.sectors,
+                         author=config.author, exptime=config.exptime)
     span = lc.time.value[-1] - lc.time.value[0]
     print(f"  Zeitspanne: {span:.1f} d, {len(lc.flux)} Datenpunkte")
 
@@ -1268,10 +1312,10 @@ def main() -> None:
     print("\n[2] Berechne Powerspektrum ...")
     freq, power = compute_power_spectrum(
         lc,
-        fmin_uHz=args.fmin,
-        fmax_uHz=args.fmax,
-        oversample=args.oversample,
-        auto_raise_sc_fmax=bool(np.isclose(args.fmax, FMAX_UHZ)),
+        fmin_uHz=config.fmin,
+        fmax_uHz=config.fmax,
+        oversample=config.oversample,
+        auto_raise_sc_fmax=bool(np.isclose(config.fmax, FMAX_UHZ)),
     )
     df = freq[1] - freq[0]
     dt_med = float(np.median(np.diff(lc.time.value))) * 86400.0
@@ -1282,8 +1326,10 @@ def main() -> None:
     # --- Schritt 3 ---
     print("\n[3] Bestimme νmax (vollautomatisch, ohne Schätzwert) ...")
     numax_result = estimate_numax_auto(freq, power, verbose=True,
-                                       gauss_smooth=args.gauss_smooth)
+                                       gauss_smooth=config.gauss_smooth)
     numax        = numax_result["numax"]
+    numax_sigma = float(numax_result["numax_sigma"])
+    qc: list[QCFlag] = []
 
     # Nyquist-Plausibilitätsprüfung nach νmax-Bestimmung.
     # Wenn νmax > 45 % der echten Nyquist-Frequenz: Ergebnis ist unsicher oder falsch.
@@ -1291,6 +1337,7 @@ def main() -> None:
     # da freq[-1] bei manuell gesetztem --fmax kleiner als 0.9×Nyquist sein kann.
     nyquist_check = nyquist
     if numax > 0.45 * nyquist_check:
+        qc.append(QCFlag("numax_near_nyquist", "warning", "νmax liegt über 45 % der Nyquist-Frequenz.", numax / nyquist_check))
         cadence_s = int(round(1e6 / (2.0 * nyquist_check)))
         print(
             f"\n  *** WARNUNG: Detektiertes νmax ({numax:.0f} μHz) liegt nahe der "
@@ -1308,14 +1355,40 @@ def main() -> None:
                 f"      Kepler SC:  --author Kepler --exptime 60   (Nyquist 8333 μHz,\n"
                 f"                  längere Basislinie, besser für νmax > 280 μHz)\n"
             )
+    else:
+        qc.append(QCFlag("numax_near_nyquist", "pass", "νmax liegt sicher unter der Nyquist-Warngrenze.", numax / nyquist_check))
+    relative_numax_error = numax_sigma / numax
+    qc.append(QCFlag(
+        "numax_precision",
+        "warning" if relative_numax_error > 0.2 else "pass",
+        "Relative Unsicherheit der νmax-Messung.",
+        relative_numax_error,
+    ))
 
     # --- Schritt 4 ---
     print("\n[4] Schätze Δν (Autokorrelation mit Stello-Prior) ...")
-    deltanu = estimate_deltanu(freq, power, numax, verbose=True)
+    deltanu_auto = estimate_deltanu(freq, power, numax, verbose=True)
+    deltanu_auto_sigma = 0.01 * deltanu_auto
+    deltanu, deltanu_sigma, deltanu_source = config.select_deltanu(
+        deltanu_auto, deltanu_auto_sigma
+    )
+    if deltanu_source == "override":
+        print(
+            f"  Verwende geprüften Δν-Override: {deltanu:.3f} ± {deltanu_sigma:.3f} μHz "
+            f"({config.deltanu_override.reason})"
+        )
+    expected_deltanu = 0.263 * numax**0.772
+    relative_deltanu_offset = abs(deltanu_auto - expected_deltanu) / expected_deltanu
+    qc.append(QCFlag(
+        "deltanu_scaling",
+        "warning" if relative_deltanu_offset > 0.2 else "pass",
+        "Abweichung des automatischen Δν von der Stello-Relation.",
+        relative_deltanu_offset,
+    ))
 
     # --- Schritt 5 ---
     print("\n[5] Berechne Stellar-Parameter (Skalenrelationen) ...")
-    params = scaling_relations(numax, deltanu, args.teff)
+    params = scaling_relations(numax, deltanu, config.teff)
     print(f"  Masse      : {params['mass']:.2f}  M☉")
     print(f"  Radius     : {params['radius']:.2f}  R☉")
     print(f"  log g      : {params['logg']:.2f}")
@@ -1323,43 +1396,94 @@ def main() -> None:
 
     # --- Schritt 6 ---
     print("\n[6] Erstelle Abbildung ...")
-    make_figure(lc, freq, power, numax_result, deltanu, params, args.name, outpath)
+    if legacy_outputs:
+        make_figure(lc, freq, power, numax_result, deltanu, params, config.label, outpath)
 
-    if args.pbjam:
+    reliable_modes: dict[str, np.ndarray] | None = None
+    candidates: list[dict[str, float | int]] = []
+    d02_result = None
+    if config.pbjam:
         from pbjam_bridge import (
+            adaptive_quality_threshold,
             filter_reliable_modes,
-            find_avoided_crossings,
             run_pbjam_modeid,
         )
 
-        numax_sigma = args.pbjam_numax_sigma or numax_result["numax_sigma"]
-        deltanu_sigma = args.pbjam_deltanu_sigma or 0.01 * deltanu
+        pbjam_numax_sigma = config.pbjam_numax_sigma or numax_sigma
+        pbjam_deltanu_sigma = config.pbjam_deltanu_sigma or deltanu_sigma
         modes = run_pbjam_modeid(
             freq,
             power,
-            numax=(numax, numax_sigma),
-            deltanu=(deltanu, deltanu_sigma),
-            teff=(args.teff, args.teff_sigma),
-            bp_rp=(args.bp_rp, args.bp_rp_sigma) if args.bp_rp is not None else None,
-            star_id=args.tic,
-            n_orders=args.pbjam_orders,
-            force=args.pbjam_refresh,
+            numax=(numax, pbjam_numax_sigma),
+            deltanu=(deltanu, pbjam_deltanu_sigma),
+            teff=(config.teff, config.teff_sigma),
+            bp_rp=(config.bp_rp, config.bp_rp_sigma) if config.bp_rp is not None else None,
+            star_id=config.id,
+            n_orders=config.pbjam_orders,
+            force=config.pbjam_refresh,
+            reuse_existing_cache=config.pbjam_reuse_existing,
         )
-        reliable_modes = filter_reliable_modes(modes, args.pbjam_quality_min)
+        quality = np.asarray(modes["quality"], dtype=float)
+        finite_quality = quality[np.isfinite(quality)]
+        quality_median = float(np.median(finite_quality)) if len(finite_quality) else None
+        quality_threshold = config.pbjam_quality_min
+        if quality_threshold is None:
+            quality_threshold = adaptive_quality_threshold(
+                modes,
+                factor=config.pbjam_quality_factor,
+                floor=config.pbjam_quality_floor,
+                ceiling=config.pbjam_quality_ceiling,
+            )
+        reliable_modes = filter_reliable_modes(
+            modes,
+            quality_min=quality_threshold,
+            height_min=config.pbjam_height_min,
+        )
         freq_modes = reliable_modes["freq"]
         amp_modes = reliable_modes["height"]
         labels = reliable_modes["l"]
         print(
             f"  PBjam-Moden: {len(modes['freq'])} insgesamt, {len(freq_modes)} zuverlässig "
             f"(l=0: {np.sum(labels == 0)}, l=1: {np.sum(labels == 1)}, "
-            f"l=2: {np.sum(labels == 2)}; Qualität > {args.pbjam_quality_min:g})"
+            f"l=2: {np.sum(labels == 2)}; Qualität ≥ {quality_threshold:.2f}, "
+            f"Höhe ≥ {config.pbjam_height_min:g})"
         )
-        crossings = find_avoided_crossings(freq_modes[labels == 1], deltanu)
-        if len(crossings["crossings"]):
-            crossing_text = ", ".join(f"{value:.2f}" for value in crossings["crossings"])
+        candidates = crossing_candidates(freq_modes[labels == 1], deltanu)
+        if candidates:
+            crossing_text = ", ".join(f"{item['midpoint']:.2f}" for item in candidates)
             print(f"  Kandidaten für avoided crossings: {crossing_text} μHz")
         else:
             print("  Keine avoided-crossing-Kandidaten in den zuverlässigen l=1-Moden.")
+        d02_result = measure_d02(modes, quality_min=config.pbjam_d02_quality_min)
+        minimum_mode_count = 3 if span < 60.0 else 5
+        mode_status = "warning" if len(freq_modes) < minimum_mode_count else "pass"
+        qc.append(QCFlag("raw_mode_count", "pass", "Anzahl ungefilterter PBjam-Moden.", len(modes["freq"])))
+        qc.append(QCFlag(
+            "reliable_mode_count",
+            mode_status,
+            f"Anzahl zuverlässiger PBjam-Moden (Minimum {minimum_mode_count} für {span:.1f} d Beobachtungsdauer).",
+            len(freq_modes),
+        ))
+        quality_floor_status = "warning" if quality_median is not None and quality_median < 0.9 else "pass"
+        qc.append(QCFlag(
+            "quality_floor",
+            quality_floor_status,
+            "Median der PBjam-Qualität; niedrige Werte kennzeichnen eine begrenzte Peakbagging-Präzision.",
+            quality_median,
+        ))
+        d02_status = "warning" if d02_result.pairs == 0 else "pass"
+        qc.append(QCFlag(
+            "d02_pairs",
+            d02_status,
+            f"Anzahl eindeutiger l=0/2-Ordnungs-Paare bei Quality ≥ {config.pbjam_d02_quality_min:g}.",
+            d02_result.pairs,
+        ))
+        if config.pbjam_reuse_existing:
+            qc.append(QCFlag(
+                "pbjam_cache_adopted",
+                "warning",
+                "Vorhandener PBjam-Cache wurde für die kontrollierte Migration trotz möglicher Signaturabweichung zugelassen.",
+            ))
     else:
         freq_modes, amp_modes = extract_oscillation_modes(
             freq, numax_result.get("snr_white", numax_result["snr"]), numax, deltanu
@@ -1372,20 +1496,81 @@ def main() -> None:
             f"ε₀={eps0:.3f})"
         )
     if len(freq_modes) > 0:
-        plot_replicated_echelle(
-            freq_modes,
-            amp_modes,
-            labels,
-            deltanu,
-            numax,
-            args.name,
-            replicated_outpath,
-            n_replicas=args.echelle_replicas,
-        )
+        if legacy_outputs:
+            plot_replicated_echelle(
+                freq_modes,
+                amp_modes,
+                labels,
+                deltanu,
+                numax,
+                config.label,
+                replicated_outpath,
+                n_replicas=config.echelle_replicas,
+            )
     else:
         print("  Kein repliziertes Échelle erzeugt: keine signifikanten Moden gefunden.")
 
+    mode_counts = {
+        f"l{degree}": int(np.sum(labels == degree)) for degree in (0, 1, 2)
+    }
+    mode_counts["reliable_total"] = int(len(freq_modes))
+    if config.pbjam:
+        mode_counts.update({
+            "raw_total": int(len(modes["freq"])),
+            "quality_threshold_used": float(quality_threshold),
+            "quality_median": quality_median,
+            "height_min_used": float(config.pbjam_height_min),
+            "d02_quality_threshold_used": float(config.pbjam_d02_quality_min),
+        })
+    result = AtlasResult(
+        target=config,
+        numax=float(numax),
+        numax_sigma=numax_sigma,
+        deltanu_auto=float(deltanu_auto),
+        deltanu_auto_sigma=float(deltanu_auto_sigma),
+        deltanu_used=float(deltanu),
+        deltanu_used_sigma=float(deltanu_sigma),
+        deltanu_source=deltanu_source,
+        stellar_parameters={key: float(value) for key, value in params.items()},
+        d02=d02_result.value if d02_result is not None else None,
+        d02_sigma=d02_result.uncertainty if d02_result is not None else None,
+        d02_pairs=d02_result.pairs if d02_result is not None else 0,
+        crossing_candidates=candidates,
+        mode_counts=mode_counts,
+        qc=qc,
+        provenance={
+            "python": sys.version.split()[0],
+            "pbjam_cache_policy": "adopt_existing" if config.pbjam_reuse_existing else "exact",
+        },
+    )
+    if write_atlas:
+        atlas_dir = _atlas_output_dir(config.id)
+        diagnostics_path = atlas_dir / "diagnostics.npz"
+        atlas_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            diagnostics_path,
+            freq=freq,
+            power=power,
+            harvey_bg=numax_result["harvey_bg"],
+            snr=numax_result["snr"],
+            snr_white=numax_result.get("snr_white", numax_result["snr"]),
+            snr_smooth=numax_result["snr_smooth"],
+        )
+        result.artifacts["diagnostics"] = str(diagnostics_path)
+        if reliable_modes is not None:
+            result.artifacts["pbjam_modes"] = str(Path("results/tables") / f"{'_'.join(config.id.split())}_pbjam_modes.csv")
+        summary_path = atlas_dir / "summary.json"
+        result.artifacts["summary"] = str(summary_path)
+        result.write_json(summary_path)
+        print(f"  Atlas-Ergebnis gespeichert: {summary_path}")
+
     print(f"\n{sep}\n")
+    return result
+
+
+def main() -> None:
+    args = _parse_args()
+    analyze_target(_target_config_from_args(args))
 
 
 if __name__ == "__main__":

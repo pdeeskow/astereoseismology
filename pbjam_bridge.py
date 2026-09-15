@@ -16,6 +16,7 @@ import numpy as np
 
 PBJAM_MIN_VERSION = (2, 0)
 MODE_KEYS = ("freq", "freq_err", "l", "n", "height", "height_err", "width", "width_err", "quality")
+CACHE_SCHEMA_VERSION = 2
 
 
 def _safe_name(value: str) -> str:
@@ -107,6 +108,33 @@ def _cache_signature(
     return digest.hexdigest()
 
 
+def _cache_metadata(
+    freq: np.ndarray,
+    power: np.ndarray,
+    obs: dict[str, tuple[float, float]],
+    n_orders: int,
+) -> dict[str, Any]:
+    return {
+        "frequency_sha256": hashlib.sha256(np.ascontiguousarray(freq).tobytes()).hexdigest(),
+        "power_sha256": hashlib.sha256(np.ascontiguousarray(power).tobytes()).hexdigest(),
+        "frequency_points": len(freq),
+        "frequency_min": float(freq[0]),
+        "frequency_max": float(freq[-1]),
+        "obs": {key: list(value) for key, value in obs.items()},
+        "n_orders": n_orders,
+    }
+
+
+def _cached_modes(cached: dict[str, Any]) -> dict[str, np.ndarray]:
+    modes = cached.get("modes")
+    if not isinstance(modes, dict) or any(key not in modes for key in MODE_KEYS):
+        raise ValueError("Der PBjam-Cache enthält keine vollständigen Modenparameter.")
+    arrays = {key: np.asarray(modes[key]) for key in MODE_KEYS}
+    if len({len(value) for value in arrays.values()}) != 1:
+        raise ValueError("Der PBjam-Cache enthält inkonsistente Modenarrays.")
+    return arrays
+
+
 def _mode_orders(modeid_result: dict[str, Any], peakbag_result: dict[str, Any]) -> np.ndarray:
     peak_freq = np.asarray(peakbag_result["summary"]["freq"])[0]
     peak_l = np.asarray(peakbag_result["ell"], dtype=int).ravel()
@@ -163,9 +191,31 @@ def extract_modes(
     return modes
 
 
-def filter_reliable_modes(modes: dict[str, np.ndarray], quality_min: float = 2.0) -> dict[str, np.ndarray]:
-    """Behält Moden, deren Frequenzposterior enger als der PBjam-Prior ist."""
-    mask = np.asarray(modes["quality"]) > quality_min
+def adaptive_quality_threshold(
+    modes: dict[str, np.ndarray],
+    factor: float = 1.10,
+    floor: float = 0.75,
+    ceiling: float = 2.0,
+) -> float:
+    """Leitet den Quality-Cut aus dem Median der endlichen Modenwerte ab."""
+    quality = np.asarray(modes["quality"], dtype=float)
+    finite_quality = quality[np.isfinite(quality)]
+    if not len(finite_quality):
+        return floor
+    return float(np.clip(np.median(finite_quality) * factor, floor, ceiling))
+
+
+def filter_reliable_modes(
+    modes: dict[str, np.ndarray],
+    quality_min: float | None = None,
+    height_min: float = 1.0,
+) -> dict[str, np.ndarray]:
+    """Behält Moden mit informativem Frequenzposterior und messbarer Höhe."""
+    if quality_min is None:
+        quality_min = adaptive_quality_threshold(modes)
+    quality = np.asarray(modes["quality"], dtype=float)
+    height = np.asarray(modes["height"], dtype=float)
+    mask = (quality >= quality_min) & (height >= height_min)
     return {key: np.asarray(value)[mask] for key, value in modes.items()}
 
 
@@ -188,13 +238,22 @@ def find_avoided_crossings(
 
 
 def _write_outputs(
-    modes: dict[str, np.ndarray], cache_path: Path, table_path: Path, signature: str
+    modes: dict[str, np.ndarray],
+    cache_path: Path,
+    table_path: Path,
+    signature: str,
+    metadata: dict[str, Any],
 ) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     table_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(
         json.dumps(
-            {"schema": 1, "signature": signature, "modes": {key: value.tolist() for key, value in modes.items()}},
+            {
+                "schema": CACHE_SCHEMA_VERSION,
+                "signature": signature,
+                "inputs": metadata,
+                "modes": {key: value.tolist() for key, value in modes.items()},
+            },
             indent=2,
         ),
         encoding="utf-8",
@@ -217,6 +276,7 @@ def run_pbjam_modeid(
     n_orders: int = 7,
     use_cache: bool = True,
     force: bool = False,
+    reuse_existing_cache: bool = False,
 ) -> dict[str, np.ndarray]:
     """Führt PBjam ModeID und Peakbagging auf einer Parseval-normierten PSD aus."""
     freq, power = _validate_inputs(freq_uHz, power_psd)
@@ -234,9 +294,19 @@ def run_pbjam_modeid(
     signature = _cache_signature(freq, power, obs, n_orders)
     if use_cache and not force and cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if cached.get("schema") == 1 and cached.get("signature") == signature:
+        if cached.get("schema") in (1, CACHE_SCHEMA_VERSION) and cached.get("signature") == signature:
             print(f"  PBjam-Cache geladen: {cache_path}")
-            return {key: np.asarray(value) for key, value in cached["modes"].items()}
+            return _cached_modes(cached)
+        if reuse_existing_cache:
+            print(
+                f"  WARNUNG: Vorhandener PBjam-Cache trotz abweichender Signatur übernommen: {cache_path}\n"
+                "           Nur für die kontrollierte Migration bereits geprüfter Ergebnisse verwenden."
+            )
+            return _cached_modes(cached)
+        print(
+            f"  PBjam-Cache nicht verwendet: Signatur stimmt nicht überein ({cache_path}).\n"
+            "  Für die kontrollierte Übernahme eines geprüften Alt-Caches: --reuse-existing-pbjam"
+        )
 
     installed_version = _pbjam_version()
     numpy_compatibility = _apply_numpy_compatibility()
@@ -251,6 +321,6 @@ def run_pbjam_modeid(
     target = pbjam.star(star_id, freq, power, obs, outpath=output_dir, N_p=n_orders)
     modeid_result, peakbag_result = target()
     modes = extract_modes(modeid_result, peakbag_result, deltanu=deltanu[0])
-    _write_outputs(modes, cache_path, table_path, signature)
+    _write_outputs(modes, cache_path, table_path, signature, _cache_metadata(freq, power, obs, n_orders))
     print(f"  PBjam-Tabelle gespeichert: {table_path}")
     return modes
