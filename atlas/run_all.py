@@ -60,6 +60,9 @@ def _literature_summary(target: TargetConfig) -> dict[str, Any]:
         "d02": reference.get("d02"),
         "d02_sigma": reference.get("d02_sigma"),
         "d02_pairs": 0,
+        "fap_global_gold": None,
+        "fap_global_gold_method": None,
+        "n_modes_tested": 0,
         "stellar_parameters": {
             key: reference[key] for key in ("mass", "radius", "logg") if key in reference
         },

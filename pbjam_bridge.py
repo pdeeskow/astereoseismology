@@ -15,8 +15,9 @@ import numpy as np
 
 
 PBJAM_MIN_VERSION = (2, 0)
-MODE_KEYS = ("freq", "freq_err", "l", "n", "height", "height_err", "width", "width_err", "quality")
-CACHE_SCHEMA_VERSION = 2
+BASE_MODE_KEYS = ("freq", "freq_err", "l", "n", "height", "height_err", "width", "width_err", "quality")
+MODE_KEYS = BASE_MODE_KEYS + ("height_snr_proxy", "fap_proxy")
+CACHE_SCHEMA_VERSION = 4
 
 
 def _safe_name(value: str) -> str:
@@ -127,12 +128,12 @@ def _cache_metadata(
 
 def _cached_modes(cached: dict[str, Any]) -> dict[str, np.ndarray]:
     modes = cached.get("modes")
-    if not isinstance(modes, dict) or any(key not in modes for key in MODE_KEYS):
+    if not isinstance(modes, dict) or any(key not in modes for key in BASE_MODE_KEYS):
         raise ValueError("Der PBjam-Cache enthält keine vollständigen Modenparameter.")
-    arrays = {key: np.asarray(modes[key]) for key in MODE_KEYS}
+    arrays = {key: np.asarray(modes[key]) for key in BASE_MODE_KEYS}
     if len({len(value) for value in arrays.values()}) != 1:
         raise ValueError("Der PBjam-Cache enthält inkonsistente Modenarrays.")
-    return arrays
+    return detection_significance(arrays)
 
 
 def _mode_orders(modeid_result: dict[str, Any], peakbag_result: dict[str, Any]) -> np.ndarray:
@@ -188,7 +189,173 @@ def extract_modes(
     lengths = {len(value) for value in modes.values()}
     if len(lengths) != 1:
         raise ValueError("PBjam lieferte Modenparameter mit inkonsistenten Längen.")
-    return modes
+    return detection_significance(modes)
+
+
+def detection_significance(
+    modes: dict[str, np.ndarray],
+    n_independent: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Berechnet einen idealisierten FAP-Proxy aus PBjams Modenhöhe."""
+    if n_independent is not None and n_independent < 1:
+        raise ValueError("Die Zahl unabhängiger Frequenzbins muss positiv sein.")
+    result = {key: np.asarray(value).copy() for key, value in modes.items()}
+    lengths = {len(value) for value in result.values()}
+    if len(lengths) != 1:
+        raise ValueError("Modenarrays müssen gleich lang sein.")
+
+    snr = np.asarray(result["height"], dtype=float)
+    snr = np.where(np.isfinite(snr) & (snr >= 0), snr, 0.0)
+    p_single = np.exp(-snr)
+    if n_independent is None:
+        fap = p_single
+    else:
+        fap = -np.expm1(n_independent * np.log1p(-p_single))
+    result["height_snr_proxy"] = snr
+    result["fap_proxy"] = np.clip(fap, 0.0, 1.0)
+    return result
+
+
+def global_false_alarm_probability(fap_proxy: float, n_modes_tested: int) -> float:
+    """Nominale globale Rate für n unabhängige Tests desselben FAP-Proxys."""
+    if not 0 <= fap_proxy <= 1 or n_modes_tested < 0:
+        raise ValueError("FAP-Proxy muss in [0, 1] liegen und die Testzahl nichtnegativ sein.")
+    return float(-np.expm1(n_modes_tested * np.log1p(-fap_proxy)))
+
+
+def estimate_d02_fraction(
+    modes: dict[str, np.ndarray],
+    dnu: float,
+    anchor_mask: np.ndarray,
+) -> tuple[float, str]:
+    """Bestimmt δν₀₂/Δν aus Gold-Paaren oder einer empirischen Δν-Relation."""
+    if dnu <= 0:
+        raise ValueError("Δν muss positiv sein.")
+    frequency = np.asarray(modes["freq"], dtype=float)
+    degree = np.asarray(modes["l"], dtype=int)
+    order = np.asarray(modes.get("n", np.full(len(frequency), -1)), dtype=int)
+    anchor = np.asarray(anchor_mask, dtype=bool)
+    if len(anchor) != len(frequency):
+        raise ValueError("Der Anker-Mask muss dieselbe Länge wie die Modenarrays haben.")
+
+    fractions: list[float] = []
+    for radial_index in np.flatnonzero(anchor & (degree == 0) & (order >= 0)):
+        quadrupole = np.flatnonzero(
+            anchor & (degree == 2) & (order == order[radial_index] - 1)
+        )
+        if len(quadrupole) == 1:
+            separation = frequency[radial_index] - frequency[int(quadrupole[0])]
+            if 0 < separation < 0.2 * dnu:
+                fractions.append(float(separation / dnu))
+    if fractions:
+        return float(np.median(fractions)), "gold_pairs"
+    return float(-0.0324 * np.log10(dnu) + 0.1388), "dnu_relation"
+
+
+def _sequence_members(
+    frequency: np.ndarray,
+    candidate_mask: np.ndarray,
+    dnu: float,
+    tolerance_fraction: float,
+    minimum_length: int,
+) -> np.ndarray:
+    """Markiert Kandidaten in Läufen konsekutiver radialer Ordnungen."""
+    members = np.zeros(len(frequency), dtype=bool)
+    indices = np.flatnonzero(candidate_mask)
+    if len(indices) < minimum_length:
+        return members
+    indices = indices[np.argsort(frequency[indices])]
+    spacings_ok = np.abs(np.diff(frequency[indices]) - dnu) <= tolerance_fraction * dnu
+    start = 0
+    for boundary in np.flatnonzero(~spacings_ok):
+        stop = int(boundary) + 1
+        if stop - start >= minimum_length:
+            members[indices[start:stop]] = True
+        start = stop
+    if len(indices) - start >= minimum_length:
+        members[indices[start:]] = True
+    return members
+
+
+def tier_modes(
+    modes: dict[str, np.ndarray],
+    fap_gold: float = 0.01,
+    fap_silver: float = 0.1,
+    quality_min: float | None = None,
+    dnu: float | None = None,
+    ridge_tol_uHz: float = 1.5,
+    d02_fraction: float | None = None,
+    sequence_tolerance: float = 0.10,
+    sequence_minimum: int = 3,
+) -> dict[str, np.ndarray]:
+    """Kennzeichnet Moden als Gold, Silber oder Rest."""
+    if not 0 <= fap_gold <= fap_silver <= 1:
+        raise ValueError("FAP-Schwellen müssen 0 ≤ Gold ≤ Silber ≤ 1 erfüllen.")
+    if dnu is not None and (dnu <= 0 or ridge_tol_uHz <= 0):
+        raise ValueError("Ridge-Test benötigt positive Δν und Toleranz.")
+    if d02_fraction is not None and not 0 < d02_fraction < 0.5:
+        raise ValueError("δν₀₂/Δν muss zwischen 0 und 0.5 liegen.")
+    if not 0 < sequence_tolerance < 1 or sequence_minimum < 3:
+        raise ValueError("Sequenztest benötigt 0 < Toleranz < 1 und mindestens drei Moden.")
+    result = detection_significance(modes)
+    fap = np.asarray(result["fap_proxy"], dtype=float)
+    gold = fap <= fap_gold
+    if quality_min is not None:
+        quality = np.asarray(result["quality"], dtype=float)
+        gold |= np.isfinite(quality) & (quality >= quality_min)
+    tier = np.full(len(fap), "rest", dtype="<U6")
+    tier[(fap <= fap_silver) & ~gold] = "silver"
+    tier[gold] = "gold"
+    ridge_deviation = np.full(len(fap), np.nan)
+    sequence_promoted = np.zeros(len(fap), dtype=bool)
+    d02_fraction_used = np.nan
+    d02_fraction_source = "none"
+    if dnu is not None:
+        degree = np.asarray(result["l"], dtype=int)
+        frequency = np.asarray(result["freq"], dtype=float)
+        radial_phases = (frequency[gold & (degree == 0)] % dnu) / dnu
+        if len(radial_phases) >= 2:
+            radial_phase = float(np.median(radial_phases))
+            if d02_fraction is None:
+                d02_fraction_used, d02_fraction_source = estimate_d02_fraction(result, dnu, gold)
+            else:
+                d02_fraction_used, d02_fraction_source = d02_fraction, "configured"
+            expected_phases = {0: radial_phase, 2: (radial_phase - d02_fraction_used) % 1.0}
+            for mode_degree, expected_phase in expected_phases.items():
+                selected = degree == mode_degree
+                phase_offset = np.abs((frequency[selected] % dnu) / dnu - expected_phase)
+                ridge_deviation[selected] = np.minimum(phase_offset, 1.0 - phase_offset) * dnu
+            ridge_silver = (
+                (tier == "rest")
+                & np.isin(degree, (0, 2))
+                & (ridge_deviation <= ridge_tol_uHz)
+            )
+            tier[ridge_silver] = "silver"
+            for mode_degree in (0, 2):
+                sequence_promoted |= _sequence_members(
+                    frequency,
+                    (tier != "rest") & (degree == mode_degree),
+                    dnu,
+                    sequence_tolerance,
+                    sequence_minimum,
+                ) & (tier == "silver")
+            tier[sequence_promoted] = "gold"
+    result["tier"] = tier
+    result["ridge_dev"] = ridge_deviation
+    result["sequence_promoted"] = sequence_promoted
+    result["d02_fraction_used"] = np.full(len(fap), d02_fraction_used)
+    result["d02_fraction_source"] = np.full(len(fap), d02_fraction_source, dtype="<U16")
+    return result
+
+
+def select_mode_tiers(
+    modes: dict[str, np.ndarray], tiers: tuple[str, ...] = ("gold",)
+) -> dict[str, np.ndarray]:
+    """Wählt vollständige Modenarrays anhand ihrer Konfidenzstufe aus."""
+    if "tier" not in modes:
+        raise ValueError("Moden müssen vor der Auswahl mit tier_modes klassifiziert werden.")
+    mask = np.isin(np.asarray(modes["tier"]), tiers)
+    return {key: np.asarray(value)[mask] for key, value in modes.items()}
 
 
 def adaptive_quality_threshold(
@@ -294,7 +461,7 @@ def run_pbjam_modeid(
     signature = _cache_signature(freq, power, obs, n_orders)
     if use_cache and not force and cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if cached.get("schema") in (1, CACHE_SCHEMA_VERSION) and cached.get("signature") == signature:
+        if cached.get("schema") in (1, 2, 3, CACHE_SCHEMA_VERSION) and cached.get("signature") == signature:
             print(f"  PBjam-Cache geladen: {cache_path}")
             return _cached_modes(cached)
         if reuse_existing_cache:

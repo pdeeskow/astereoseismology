@@ -56,16 +56,24 @@ def load_modes(summary: dict[str, Any]) -> dict[str, np.ndarray] | None:
         rows = list(csv.DictReader(handle))
     if not rows:
         return None
-    return {
+    modes = {
         "freq": np.asarray([float(row["freq"]) for row in rows]),
         "l": np.asarray([int(float(row["l"])) for row in rows]),
         "quality": np.asarray([float(row["quality"]) for row in rows]),
         "height": np.asarray([float(row["height"]) for row in rows]),
     }
+    for key in ("height_snr_proxy", "fap_proxy"):
+        if key in rows[0]:
+            modes[key] = np.asarray([float(row[key]) for row in rows])
+    return modes
 
 
 def save_figure(fig: Any, path: str | Path) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, bbox_inches="tight")
+    try:
+        fig.savefig(output, bbox_inches="tight")
+    except PermissionError:
+        output = output.with_suffix(".png")
+        fig.savefig(output, bbox_inches="tight")
     return output

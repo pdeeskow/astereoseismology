@@ -21,6 +21,7 @@ von der Lichtkurve bis zu abgeleiteten Stellar-Parametern.
 - Ausgabe als 4-Panel-Figur (Lichtkurve, PSD+Harvey, SNR, Échelle)
 - Zusätzliches repliziertes Échelle mit farbcodierten l=0/1/2-Modenkandidaten
 - Optionale Bayesianische Modenidentifikation und Peakbagging mit PBjam >= 2.0
+- Evidenzgestützte PBjam-Auswahl mit getrennten Gold- und Silber-Moden
 
 ## Voraussetzungen
 
@@ -109,7 +110,32 @@ Wichtige CLI-Optionen:
 - --bp-rp, --bp-rp-sigma: Optionale Gaia-Farbe mit Unsicherheit
 - --pbjam-orders: Anzahl modellierter radialer Ordnungen (Standard: 7)
 - --pbjam-quality-min: Optionaler fester Quality-Cut; standardmäßig adaptiv (Median × 1.10, begrenzt auf 0.75 bis 2.0)
+- --pbjam-fap-gold, --pbjam-fap-silver: Empirisch kalibrierte Schwellen des Höhen-FAP-Proxys
+- --pbjam-ridge-tol: Maximale Abweichung schwacher l=0/2-Moden vom Anker-Ridge in μHz
+- --pbjam-d02-fraction: Optionaler fester δν₀₂/Δν-Wert; sonst Gold-Paare oder Δν-Relation
+- --pbjam-sequence-tolerance, --pbjam-sequence-minimum: Regularitätstest konsekutiver l=0/2-Moden
 - --pbjam-refresh: Vorhandenen Ergebnis-Cache ignorieren
+
+## Konfidenz der PBjam-Moden
+
+PBjams `height` korreliert mit der Detektionsstärke, ist aber keine extern
+kalibrierte SNR. Deshalb wird `exp(-height)` als **FAP-Proxy** und nicht als
+kalibrierte Falschalarmwahrscheinlichkeit ausgewiesen. Die Standardgrenzen
+`0.01` und `0.1` entsprechen den empirischen Höhenschnitten 4.61 und 2.30.
+Die Summary speichert zusätzlich die nominale globale Rate
+`fap_global_gold = 1 - (1 - fap_gold) ** n_modes_tested`. Diese Šidák-Größe
+setzt unabhängige Tests und die ideale Höhenstatistik voraus; sie beschreibt
+nicht die zusätzliche Quality-, Ridge- oder Sequenzevidenz.
+
+Gold-Moden dürfen für quantitative Messungen verwendet werden. Silber-Moden
+werden im Échelle offen dargestellt. Der l=0-Ridge wird ausschließlich aus
+Gold-Ankern bestimmt. Der l=2-Versatz wird zuerst aus vorhandenen Gold-Paaren
+geschätzt; ohne solche Paare gilt
+`δν₀₂/Δν = -0.0324 log10(Δν) + 0.1388`. Bereits anderweitig bestätigte
+l=0/2-Moden werden zu Gold hochgestuft, wenn mindestens drei konsekutive
+Ordnungen Abstände innerhalb `Δν ± 10 %` bilden. Der Sequenztest wird niemals
+auf l=1 angewandt, weil gemischte Moden und Avoided Crossings dessen
+Regularitätsannahme verletzen.
 
 ## Ausgabe
 

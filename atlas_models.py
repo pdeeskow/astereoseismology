@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-ATLAS_SCHEMA_VERSION = 1
+ATLAS_SCHEMA_VERSION = 2
 QCStatus = Literal["pass", "warning", "failed"]
 
 
@@ -49,6 +49,12 @@ class TargetConfig:
     pbjam_quality_floor: float = 0.75
     pbjam_quality_ceiling: float = 2.0
     pbjam_height_min: float = 1.0
+    pbjam_fap_gold: float = 0.01
+    pbjam_fap_silver: float = 0.1
+    pbjam_ridge_tol_uHz: float = 1.5
+    pbjam_d02_fraction: float | None = None
+    pbjam_sequence_tolerance: float = 0.10
+    pbjam_sequence_minimum: int = 3
     pbjam_d02_quality_min: float = 0.65
     pbjam_refresh: bool = False
     pbjam_reuse_existing: bool = False
@@ -80,6 +86,14 @@ class TargetConfig:
             raise ValueError("Die PBjam-Quality-Obergrenze muss mindestens der Untergrenze entsprechen.")
         if self.pbjam_height_min < 0 or self.pbjam_d02_quality_min < 0:
             raise ValueError("PBjam-Höhen- und Paargrenzen dürfen nicht negativ sein.")
+        if not 0 <= self.pbjam_fap_gold <= self.pbjam_fap_silver <= 1:
+            raise ValueError("PBjam-FAP-Schwellen müssen 0 ≤ Gold ≤ Silber ≤ 1 erfüllen.")
+        if self.pbjam_ridge_tol_uHz <= 0:
+            raise ValueError("Die PBjam-Ridge-Toleranz muss positiv sein.")
+        if self.pbjam_d02_fraction is not None and not 0 < self.pbjam_d02_fraction < 0.5:
+            raise ValueError("Das optionale δν₀₂/Δν-Verhältnis ist ungültig.")
+        if not 0 < self.pbjam_sequence_tolerance < 1 or self.pbjam_sequence_minimum < 3:
+            raise ValueError("PBjam-Sequenzen benötigen 0 < Toleranz < 1 und mindestens drei Moden.")
 
     def select_deltanu(self, automatic: float, automatic_sigma: float) -> tuple[float, float, str]:
         if automatic <= 0 or automatic_sigma <= 0:
@@ -115,8 +129,11 @@ class AtlasResult:
     d02: float | None = None
     d02_sigma: float | None = None
     d02_pairs: int = 0
+    fap_global_gold: float | None = None
+    fap_global_gold_method: str | None = None
+    n_modes_tested: int = 0
     crossing_candidates: list[dict[str, Any]] = field(default_factory=list)
-    mode_counts: dict[str, int | float | None] = field(default_factory=dict)
+    mode_counts: dict[str, int | float | str | None] = field(default_factory=dict)
     qc: list[QCFlag] = field(default_factory=list)
     artifacts: dict[str, str] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)

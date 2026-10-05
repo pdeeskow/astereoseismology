@@ -17,7 +17,7 @@ class D02Measurement:
 
 
 def measure_d02(
-    modes: dict[str, np.ndarray], quality_min: float = 0.65
+    modes: dict[str, np.ndarray], quality_min: float | None = 0.65
 ) -> D02Measurement:
     """Misst delta-nu-02 mit einer lockeren, von der Hauptauswahl getrennten Schwelle."""
     frequency = np.asarray(modes["freq"], dtype=float)
@@ -26,7 +26,7 @@ def measure_d02(
     order = np.asarray(modes["n"], dtype=int)
     if len({len(frequency), len(frequency_error), len(degree), len(order)}) != 1:
         raise ValueError("Modenarrays müssen gleich lang sein.")
-    if "quality" in modes:
+    if "quality" in modes and quality_min is not None:
         quality = np.asarray(modes["quality"], dtype=float)
         if len(quality) != len(frequency):
             raise ValueError("Modenarrays müssen gleich lang sein.")

@@ -32,6 +32,9 @@ class CLICompatibilityTests(unittest.TestCase):
                 oversample=2, gauss_smooth=False, echelle_replicas=2, pbjam=False,
                 pbjam_numax_sigma=None, pbjam_deltanu_sigma=None, pbjam_orders=7,
                 pbjam_quality_min=2.0, pbjam_refresh=False, reuse_existing_pbjam=False,
+                pbjam_fap_gold=0.01, pbjam_fap_silver=0.1,
+                pbjam_ridge_tol=1.5, pbjam_d02_fraction=None,
+                pbjam_sequence_tolerance=0.10, pbjam_sequence_minimum=3,
                 bp_rp=None, bp_rp_sigma=0.05,
             )
 

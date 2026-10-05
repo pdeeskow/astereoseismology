@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from atlas_models import AtlasResult, DeltanuOverride, QCFlag, TargetConfig
+from atlas_models import ATLAS_SCHEMA_VERSION, AtlasResult, DeltanuOverride, QCFlag, TargetConfig
 
 
 class AtlasModelTests(unittest.TestCase):
@@ -47,7 +47,7 @@ class AtlasModelTests(unittest.TestCase):
             result.write_json(output)
             saved = json.loads(output.read_text(encoding="utf-8"))
 
-        self.assertEqual(saved["schema"], 1)
+        self.assertEqual(saved["schema"], ATLAS_SCHEMA_VERSION)
         self.assertEqual(saved["qc_status"], "warning")
         self.assertEqual(saved["target"]["id"], "KIC 1")
 

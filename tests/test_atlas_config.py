@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from atlas_config import load_targets
 from atlas.run_all import _cached_summary, _literature_summary, _stored_summaries
-from atlas_models import TargetConfig
+from atlas_models import ATLAS_SCHEMA_VERSION, TargetConfig
 
 
 class AtlasConfigTests(unittest.TestCase):
@@ -18,6 +18,10 @@ class AtlasConfigTests(unittest.TestCase):
         self.assertEqual(target.pbjam_quality_floor, 0.75)
         self.assertEqual(target.pbjam_quality_ceiling, 2.0)
         self.assertEqual(target.pbjam_height_min, 1.0)
+        self.assertEqual(target.pbjam_ridge_tol_uHz, 1.5)
+        self.assertIsNone(target.pbjam_d02_fraction)
+        self.assertEqual(target.pbjam_sequence_tolerance, 0.10)
+        self.assertEqual(target.pbjam_sequence_minimum, 3)
         self.assertEqual(target.pbjam_d02_quality_min, 0.65)
 
     def test_loads_nested_analysis_separately_from_reference(self):
@@ -84,7 +88,7 @@ targets:
             summary_dir.mkdir(parents=True)
             (summary_dir / "diagnostics.npz").write_bytes(b"data")
             (summary_dir / "summary.json").write_text(
-                json.dumps({"schema": 1, "target": cached_target.__dict__}),
+                json.dumps({"schema": ATLAS_SCHEMA_VERSION, "target": cached_target.__dict__}),
                 encoding="utf-8",
             )
             with patch("atlas.run_all._atlas_output_dir", return_value=summary_dir):

@@ -11,10 +11,15 @@ from pbjam_bridge import (
     _apply_jax_compatibility,
     _apply_numpy_compatibility,
     _pbjam_version,
+    detection_significance,
+    estimate_d02_fraction,
     extract_modes,
     filter_reliable_modes,
     find_avoided_crossings,
+    global_false_alarm_probability,
     run_pbjam_modeid,
+    select_mode_tiers,
+    tier_modes,
 )
 
 
@@ -47,6 +52,77 @@ class PBjamBridgeTests(unittest.TestCase):
         reliable = filter_reliable_modes(modes, quality_min=2.0)
 
         np.testing.assert_allclose(reliable["freq"], [100.1, 112.1])
+
+    def test_computes_false_alarm_probability_from_pbjam_snr_height(self):
+        modes = extract_modes(self.modeid, self.peakbag, deltanu=10.0)
+
+        significant = detection_significance(modes)
+
+        np.testing.assert_allclose(significant["height_snr_proxy"], [4.0, 3.0, 2.0])
+        np.testing.assert_allclose(significant["fap_proxy"], np.exp([-4.0, -3.0, -2.0]))
+
+    def test_reports_nominal_global_false_alarm_probability(self):
+        self.assertAlmostEqual(global_false_alarm_probability(0.01, 28), 0.2452807128)
+
+    def test_assigns_gold_and_silver_tiers_without_discarding_quality(self):
+        modes = extract_modes(self.modeid, self.peakbag, deltanu=10.0)
+
+        classified = tier_modes(modes, fap_gold=0.01, fap_silver=0.14, quality_min=5.0)
+        displayed = select_mode_tiers(classified, ("gold", "silver"))
+
+        np.testing.assert_array_equal(classified["tier"], ["silver", "silver", "gold"])
+        np.testing.assert_allclose(displayed["freq"], [100.1, 105.2, 112.1])
+
+    def test_ridge_promotes_weak_l2_but_skips_mixed_l1_modes(self):
+        modes = {
+            "freq": np.array([100.0, 110.0, 106.2, 105.0]),
+            "height": np.array([6.0, 6.0, 0.5, 0.5]),
+            "quality": np.zeros(4),
+            "l": np.array([0, 0, 2, 1]),
+        }
+
+        classified = tier_modes(modes, dnu=10.0, ridge_tol_uHz=1.0, d02_fraction=0.4)
+
+        np.testing.assert_array_equal(classified["tier"], ["gold", "gold", "silver", "rest"])
+        self.assertAlmostEqual(classified["ridge_dev"][2], 0.2)
+        self.assertTrue(np.isnan(classified["ridge_dev"][3]))
+
+    def test_uses_dnu_relation_when_no_gold_l2_pair_exists(self):
+        modes = {
+            "freq": np.array([100.0, 110.0]),
+            "l": np.array([0, 0]),
+            "n": np.array([10, 11]),
+        }
+
+        fraction, source = estimate_d02_fraction(modes, 100.0, np.array([True, True]))
+
+        self.assertAlmostEqual(fraction, 0.074)
+        self.assertEqual(source, "dnu_relation")
+
+    def test_prefers_gold_pairs_over_dnu_relation(self):
+        modes = {
+            "freq": np.array([100.0, 96.0, 110.0, 105.5]),
+            "l": np.array([0, 2, 0, 2]),
+            "n": np.array([10, 9, 11, 10]),
+        }
+
+        fraction, source = estimate_d02_fraction(modes, 50.0, np.ones(4, dtype=bool))
+
+        self.assertAlmostEqual(fraction, 0.085)
+        self.assertEqual(source, "gold_pairs")
+
+    def test_promotes_three_consecutive_ridge_l2_modes_to_gold(self):
+        modes = {
+            "freq": np.array([100.0, 110.0, 96.0, 106.0, 116.0, 105.0]),
+            "height": np.array([6.0, 6.0, 0.5, 0.5, 0.5, 0.5]),
+            "quality": np.zeros(6),
+            "l": np.array([0, 0, 2, 2, 2, 1]),
+        }
+
+        classified = tier_modes(modes, dnu=10.0, d02_fraction=0.4)
+
+        np.testing.assert_array_equal(classified["tier"], ["gold", "gold", "gold", "gold", "gold", "rest"])
+        np.testing.assert_array_equal(classified["sequence_promoted"], [False, False, True, True, True, False])
 
     def test_adapts_quality_threshold_and_filters_low_height(self):
         modes = extract_modes(self.modeid, self.peakbag, deltanu=10.0)

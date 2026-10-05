@@ -1013,28 +1013,39 @@ def plot_replicated_echelle(
     star_name: str,
     outpath: Path,
     n_replicas: int = 2,
+    tiers: np.ndarray | None = None,
 ) -> None:
     """Speichert ein repliziertes Échelle mit farbcodierten Modengraden."""
     fig, ax = plt.subplots(figsize=(7, 9))
     x_base = freq_modes % deltanu
     amp_scale = amp_modes / max(float(np.max(amp_modes)), np.finfo(float).eps)
 
+    confidence_levels = (None,) if tiers is None else ("silver", "gold")
     for degree in (0, 1, 2, -1):
-        mode_mask = labels == degree
-        if not np.any(mode_mask):
-            continue
-        for replica in range(n_replicas):
-            ax.scatter(
-                x_base[mode_mask] + replica * deltanu,
-                freq_modes[mode_mask],
-                s=20.0 + 180.0 * amp_scale[mode_mask],
-                c=L_COLORS[degree],
-                alpha=0.78,
-                edgecolors="white",
-                linewidths=0.4,
-                label=L_LABELS[degree] if replica == 0 else None,
-                zorder=3 if degree in (1, -1) else 2,
-            )
+        for confidence in confidence_levels:
+            mode_mask = labels == degree
+            if confidence is not None:
+                mode_mask &= tiers == confidence
+            if not np.any(mode_mask):
+                continue
+            for replica in range(n_replicas):
+                ax.scatter(
+                    x_base[mode_mask] + replica * deltanu,
+                    freq_modes[mode_mask],
+                    s=20.0 + 180.0 * amp_scale[mode_mask],
+                    facecolors=L_COLORS[degree] if confidence != "silver" else "none",
+                    edgecolors=L_COLORS[degree] if confidence == "silver" else "white",
+                    alpha=0.82,
+                    linewidths=1.2 if confidence == "silver" else 0.4,
+                    label=L_LABELS[degree] if tiers is None and replica == 0 else None,
+                    zorder=3 if degree in (1, -1) else 2,
+                )
+
+    if tiers is not None:
+        for degree in (0, 1, 2):
+            ax.scatter([], [], color=L_COLORS[degree], label=L_LABELS[degree])
+        ax.scatter([], [], facecolors="#333333", edgecolors="#333333", label="Gold")
+        ax.scatter([], [], facecolors="none", edgecolors="#333333", label="Silber")
 
     for replica in range(1, n_replicas):
         ax.axvline(replica * deltanu, color="0.5", lw=0.7, ls="--", alpha=0.5)
@@ -1242,6 +1253,18 @@ def _parse_args() -> argparse.Namespace:
                    help="Anzahl radialer Ordnungen für PBjam (Default: 7)")
     p.add_argument("--pbjam-quality-min", type=float, default=None,
                    help="Fester PBjam-Quality-Cut (Default: adaptiv aus der Qualitätsverteilung)")
+    p.add_argument("--pbjam-fap-gold", type=float, default=0.01,
+                   help="Maximale Falschalarmwahrscheinlichkeit für Gold-Moden (Default: 0.01)")
+    p.add_argument("--pbjam-fap-silver", type=float, default=0.1,
+                   help="Maximale Falschalarmwahrscheinlichkeit für Silber-Moden (Default: 0.1)")
+    p.add_argument("--pbjam-ridge-tol", type=float, default=1.5,
+                   help="Maximaler l=0/2-Ridge-Abstand für Silber-Moden in μHz (Default: 1.5)")
+    p.add_argument("--pbjam-d02-fraction", type=float, default=None,
+                   help="Optionales festes δν₀₂/Δν-Verhältnis (Default: aus Gold-Paaren oder Δν-Relation)")
+    p.add_argument("--pbjam-sequence-tolerance", type=float, default=0.10,
+                   help="Relative Δν-Toleranz für konsekutive l=0/2-Sequenzen (Default: 0.10)")
+    p.add_argument("--pbjam-sequence-minimum", type=int, default=3,
+                   help="Mindestlänge einer l=0/2-Sequenz für Gold (Default: 3)")
     p.add_argument("--pbjam-refresh", action="store_true",
                    help="Vorhandenen PBjam-Cache ignorieren und Sampling neu ausführen")
     p.add_argument("--reuse-existing-pbjam", action="store_true",
@@ -1270,6 +1293,12 @@ def _target_config_from_args(args: argparse.Namespace) -> TargetConfig:
         pbjam_deltanu_sigma=args.pbjam_deltanu_sigma,
         pbjam_orders=args.pbjam_orders,
         pbjam_quality_min=args.pbjam_quality_min,
+        pbjam_fap_gold=args.pbjam_fap_gold,
+        pbjam_fap_silver=args.pbjam_fap_silver,
+        pbjam_ridge_tol_uHz=args.pbjam_ridge_tol,
+        pbjam_d02_fraction=args.pbjam_d02_fraction,
+        pbjam_sequence_tolerance=args.pbjam_sequence_tolerance,
+        pbjam_sequence_minimum=args.pbjam_sequence_minimum,
         pbjam_refresh=args.pbjam_refresh,
         pbjam_reuse_existing=args.reuse_existing_pbjam,
         bp_rp=args.bp_rp,
@@ -1405,8 +1434,10 @@ def analyze_target(
     if config.pbjam:
         from pbjam_bridge import (
             adaptive_quality_threshold,
-            filter_reliable_modes,
+            global_false_alarm_probability,
             run_pbjam_modeid,
+            select_mode_tiers,
+            tier_modes,
         )
 
         pbjam_numax_sigma = config.pbjam_numax_sigma or numax_sigma
@@ -1434,35 +1465,46 @@ def analyze_target(
                 floor=config.pbjam_quality_floor,
                 ceiling=config.pbjam_quality_ceiling,
             )
-        reliable_modes = filter_reliable_modes(
+        tiered_modes = tier_modes(
             modes,
+            fap_gold=config.pbjam_fap_gold,
+            fap_silver=config.pbjam_fap_silver,
             quality_min=quality_threshold,
-            height_min=config.pbjam_height_min,
+            dnu=deltanu,
+            ridge_tol_uHz=config.pbjam_ridge_tol_uHz,
+            d02_fraction=config.pbjam_d02_fraction,
+            sequence_tolerance=config.pbjam_sequence_tolerance,
+            sequence_minimum=config.pbjam_sequence_minimum,
         )
+        gold_modes = select_mode_tiers(tiered_modes)
+        reliable_modes = select_mode_tiers(tiered_modes, ("gold", "silver"))
         freq_modes = reliable_modes["freq"]
         amp_modes = reliable_modes["height"]
         labels = reliable_modes["l"]
+        gold_labels = gold_modes["l"]
         print(
-            f"  PBjam-Moden: {len(modes['freq'])} insgesamt, {len(freq_modes)} zuverlässig "
-            f"(l=0: {np.sum(labels == 0)}, l=1: {np.sum(labels == 1)}, "
-            f"l=2: {np.sum(labels == 2)}; Qualität ≥ {quality_threshold:.2f}, "
-            f"Höhe ≥ {config.pbjam_height_min:g})"
+            f"  PBjam-Moden: {len(modes['freq'])} insgesamt, {len(gold_modes['freq'])} Gold, "
+            f"{np.sum(tiered_modes['tier'] == 'silver')} Silber "
+            f"(Gold: FAP-Proxy ≤ {config.pbjam_fap_gold:g}, Qualität ≥ {quality_threshold:.2f} "
+            f"oder reguläre l=0/2-Sequenz; Silber: FAP-Proxy ≤ {config.pbjam_fap_silver:g} "
+            f"oder l=0/2-Ridge ≤ "
+            f"{config.pbjam_ridge_tol_uHz:g} μHz)"
         )
-        candidates = crossing_candidates(freq_modes[labels == 1], deltanu)
+        candidates = crossing_candidates(gold_modes["freq"][gold_labels == 1], deltanu)
         if candidates:
             crossing_text = ", ".join(f"{item['midpoint']:.2f}" for item in candidates)
             print(f"  Kandidaten für avoided crossings: {crossing_text} μHz")
         else:
             print("  Keine avoided-crossing-Kandidaten in den zuverlässigen l=1-Moden.")
-        d02_result = measure_d02(modes, quality_min=config.pbjam_d02_quality_min)
+        d02_result = measure_d02(gold_modes, quality_min=None)
         minimum_mode_count = 3 if span < 60.0 else 5
-        mode_status = "warning" if len(freq_modes) < minimum_mode_count else "pass"
+        mode_status = "warning" if len(gold_modes["freq"]) < minimum_mode_count else "pass"
         qc.append(QCFlag("raw_mode_count", "pass", "Anzahl ungefilterter PBjam-Moden.", len(modes["freq"])))
         qc.append(QCFlag(
             "reliable_mode_count",
             mode_status,
             f"Anzahl zuverlässiger PBjam-Moden (Minimum {minimum_mode_count} für {span:.1f} d Beobachtungsdauer).",
-            len(freq_modes),
+            len(gold_modes["freq"]),
         ))
         quality_floor_status = "warning" if quality_median is not None and quality_median < 0.9 else "pass"
         qc.append(QCFlag(
@@ -1475,7 +1517,7 @@ def analyze_target(
         qc.append(QCFlag(
             "d02_pairs",
             d02_status,
-            f"Anzahl eindeutiger l=0/2-Ordnungs-Paare bei Quality ≥ {config.pbjam_d02_quality_min:g}.",
+            "Anzahl eindeutiger l=0/2-Ordnungs-Paare in der Gold-Stufe.",
             d02_result.pairs,
         ))
         if config.pbjam_reuse_existing:
@@ -1506,22 +1548,46 @@ def analyze_target(
                 config.label,
                 replicated_outpath,
                 n_replicas=config.echelle_replicas,
+                tiers=reliable_modes["tier"] if reliable_modes is not None else None,
             )
     else:
         print("  Kein repliziertes Échelle erzeugt: keine signifikanten Moden gefunden.")
 
-    mode_counts = {
-        f"l{degree}": int(np.sum(labels == degree)) for degree in (0, 1, 2)
-    }
-    mode_counts["reliable_total"] = int(len(freq_modes))
     if config.pbjam:
+        mode_counts = {
+            f"l{degree}": int(np.sum(gold_labels == degree)) for degree in (0, 1, 2)
+        }
+        mode_counts.update({
+            f"silver_l{degree}": int(np.sum(
+                (tiered_modes["tier"] == "silver") & (tiered_modes["l"] == degree)
+            ))
+            for degree in (0, 1, 2)
+        })
+        mode_counts.update({
+            f"display_l{degree}": int(np.sum(labels == degree)) for degree in (0, 1, 2)
+        })
         mode_counts.update({
             "raw_total": int(len(modes["freq"])),
+            "gold_total": int(len(gold_modes["freq"])),
+            "silver_total": int(np.sum(tiered_modes["tier"] == "silver")),
+            "display_total": int(len(freq_modes)),
+            "reliable_total": int(len(gold_modes["freq"])),
             "quality_threshold_used": float(quality_threshold),
             "quality_median": quality_median,
-            "height_min_used": float(config.pbjam_height_min),
-            "d02_quality_threshold_used": float(config.pbjam_d02_quality_min),
+            "fap_gold_used": float(config.pbjam_fap_gold),
+            "fap_silver_used": float(config.pbjam_fap_silver),
+            "ridge_tolerance_uHz_used": float(config.pbjam_ridge_tol_uHz),
+            "d02_fraction_used": float(tiered_modes["d02_fraction_used"][0]),
+            "d02_fraction_source": str(tiered_modes["d02_fraction_source"][0]),
+            "sequence_tolerance_used": float(config.pbjam_sequence_tolerance),
+            "sequence_minimum_used": int(config.pbjam_sequence_minimum),
+            "sequence_promoted_total": int(np.sum(tiered_modes["sequence_promoted"])),
         })
+    else:
+        mode_counts = {
+            f"l{degree}": int(np.sum(labels == degree)) for degree in (0, 1, 2)
+        }
+        mode_counts["reliable_total"] = int(len(freq_modes))
     result = AtlasResult(
         target=config,
         numax=float(numax),
@@ -1535,6 +1601,12 @@ def analyze_target(
         d02=d02_result.value if d02_result is not None else None,
         d02_sigma=d02_result.uncertainty if d02_result is not None else None,
         d02_pairs=d02_result.pairs if d02_result is not None else 0,
+        fap_global_gold=(
+            global_false_alarm_probability(config.pbjam_fap_gold, len(modes["freq"]))
+            if config.pbjam else None
+        ),
+        fap_global_gold_method="sidak_independent_height_proxy" if config.pbjam else None,
+        n_modes_tested=int(len(modes["freq"])) if config.pbjam else 0,
         crossing_candidates=candidates,
         mode_counts=mode_counts,
         qc=qc,
